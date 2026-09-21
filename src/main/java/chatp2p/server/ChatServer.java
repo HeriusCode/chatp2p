@@ -21,7 +21,6 @@ import java.util.logging.Logger;
 public final class ChatServer implements AutoCloseable {
     public static final int DEFAULT_PORT = 5000;
     public static final int DEFAULT_MAX_CLIENTS = 64;
-    private static final int CLIENT_READ_TIMEOUT_MILLIS = 120_000;
 
     private final int configuredPort;
     private final ExecutorService clientPool;
@@ -181,7 +180,8 @@ public final class ChatServer implements AutoCloseable {
     private void configure(Socket socket) throws SocketException {
         socket.setKeepAlive(true);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(CLIENT_READ_TIMEOUT_MILLIS);
+        // Control sockets are persistent; clients send periodic PING messages.
+        socket.setSoTimeout(0);
     }
 
     private void closeServerSocket() {

@@ -217,7 +217,8 @@ final class FileTransferManager implements AutoCloseable {
             try (Socket transferSocket = new Socket()) {
                 socket = transferSocket;
                 transferSocket.connect(new InetSocketAddress(peer.host(), peer.port()), 5_000);
-                transferSocket.setSoTimeout(30_000);
+                // Receiving users may need several minutes to notice and answer the dialog.
+                transferSocket.setSoTimeout(300_000);
                 transferSocket.setTcpNoDelay(true);
                 try (DataOutputStream output = new DataOutputStream(
                             new BufferedOutputStream(transferSocket.getOutputStream()));

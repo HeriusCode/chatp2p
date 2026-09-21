@@ -113,6 +113,8 @@ final class PeerServer implements AutoCloseable {
                         .field("status", "RECEIVED")
                         .build());
             } else if (request.type() == MessageType.FILE_REQUEST) {
+                // A human may need time to review the incoming-file dialog.
+                socket.setSoTimeout(0);
                 fileTransferManager.receive(request, input, output);
             } else {
                 sendError(output, request, "UNSUPPORTED_PEER_MESSAGE");

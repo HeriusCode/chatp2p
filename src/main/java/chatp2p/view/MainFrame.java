@@ -21,6 +21,7 @@ import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -30,7 +31,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -72,16 +72,11 @@ public final class MainFrame extends JFrame {
     private final JTextField messageField = new JTextField();
     private final JButton fileButton = new JButton("FILE");
     private final JButton sendButton = new JButton("GỬI");
-    private final JPanel transferPanel = new JPanel(new BorderLayout(10, 5));
-    private final JLabel transferTitle = new JLabel();
-    private final JLabel transferDetail = new JLabel();
-    private final JProgressBar transferProgress = new JProgressBar(0, 100);
-    private final JButton cancelTransferButton = new JButton("HỦY");
-    private final Map<String, List<ChatMessage>> histories = new HashMap<>();
+    private final Map<String, List<ConversationEntry>> histories = new HashMap<>();
+    private final Map<UUID, FileEntry> fileEntries = new HashMap<>();
     private final Map<UUID, TransferHandle> outgoingTransfers = new HashMap<>();
     private final Timer connectionTimer;
     private volatile PeerInfo selectedPeer;
-    private volatile UUID displayedTransferId;
 
     private final ClientEventListener eventListener = new ClientEventListener() {
         @Override
@@ -96,55 +91,31 @@ public final class MainFrame extends JFrame {
 
         @Override
         public boolean onFileOffered(FileInfo file) {
-            AtomicBoolean accepted = new AtomicBoolean(false);
-            Runnable prompt = () -> {
-                String message = "File: " + file.fileName()
-                        + "\nKích thước: " + formatBytes(file.size())
-                        + "\nTừ: " + file.sender()
-                        + "\n\nBạn có muốn nhận file này không?";
-                accepted.set(JOptionPane.showConfirmDialog(
-                        MainFrame.this,
-                        message,
-                        "File đến từ " + file.sender(),
-                        JOptionPane.YES_NO_OPTION,
-                        JOptionPane.QUESTION_MESSAGE) == JOptionPane.YES_OPTION);
-            };
-            if (SwingUtilities.isEventDispatchThread()) {
-                prompt.run();
-            } else {
-                try {
-                    SwingUtilities.invokeAndWait(prompt);
-                } catch (Exception failure) {
-                    return false;
-                }
-            }
-            return accepted.get();
+            TransferProgress offered = new TransferProgress(
+                    file,
+                    TransferDirection.RECEIVING,
+                    TransferState.WAITING,
+                    0,
+                    0,
+                    -1,
+                    "Preparing to receive");
+            SwingUtilities.invokeLater(() -> updateFileEntry(offered));
+            return true;
         }
 
         @Override
         public void onTransferProgress(TransferProgress progress) {
-            SwingUtilities.invokeLater(() -> showTransferProgress(progress));
+            SwingUtilities.invokeLater(() -> updateFileEntry(progress));
         }
 
         @Override
         public void onTransferCompleted(FileInfo file, Path savedPath) {
-            SwingUtilities.invokeLater(() -> {
-                if (savedPath != null) {
-                    JOptionPane.showMessageDialog(
-                            MainFrame.this,
-                            "Đã nhận file thành công:\n" + savedPath.toAbsolutePath(),
-                            "Nhận file hoàn tất",
-                            JOptionPane.INFORMATION_MESSAGE);
-                }
-            });
+            SwingUtilities.invokeLater(() -> markFileCompleted(file, savedPath));
         }
 
         @Override
         public void onTransferFailed(FileInfo file, String reason) {
-            SwingUtilities.invokeLater(() -> {
-                transferTitle.setForeground(UiTheme.DANGER);
-                transferDetail.setText(reason);
-            });
+            SwingUtilities.invokeLater(() -> markFileFailed(file, reason));
         }
 
         @Override
@@ -206,10 +177,17 @@ public final class MainFrame extends JFrame {
 
         JPanel account = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 8, 1), UiTheme.WHITE);
         account.add(UiTheme.label(client.clientName(), UiTheme.BODY_BOLD, UiTheme.NAVY));
-        account.add(UiTheme.label("●", UiTheme.BODY, UiTheme.SUCCESS));
+        JLabel onlineBadge = UiTheme.label(
+                "●  ONLINE", new Font("Segoe UI", Font.BOLD, 12), UiTheme.SUCCESS);
+        onlineBadge.setOpaque(true);
+        onlineBadge.setBackground(new Color(240, 253, 244));
+        onlineBadge.setBorder(BorderFactory.createEmptyBorder(7, 10, 7, 10));
+        account.add(onlineBadge);
         JButton disconnect = new JButton("Đăng xuất");
-        UiTheme.styleSecondaryButton(disconnect);
-        disconnect.setForeground(UiTheme.DANGER);
+        UiTheme.stylePrimaryButton(disconnect);
+        disconnect.setBackground(UiTheme.DANGER);
+        disconnect.setForeground(UiTheme.WHITE);
+        disconnect.setPreferredSize(new Dimension(112, 42));
         disconnect.addActionListener(event -> disconnectAndReturn());
         account.add(disconnect);
         header.add(brand, BorderLayout.WEST);
@@ -260,10 +238,7 @@ public final class MainFrame extends JFrame {
         messagesScroll.getVerticalScrollBar().setUnitIncrement(18);
         workspace.add(messagesScroll, BorderLayout.CENTER);
 
-        JPanel bottom = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
-        bottom.add(createTransferPanel(), BorderLayout.NORTH);
-        bottom.add(createComposer(), BorderLayout.SOUTH);
-        workspace.add(bottom, BorderLayout.SOUTH);
+        workspace.add(createComposer(), BorderLayout.SOUTH);
         return workspace;
     }
 
@@ -282,33 +257,6 @@ public final class MainFrame extends JFrame {
         labels.add(chatSubtitle);
         header.add(labels, BorderLayout.WEST);
         return header;
-    }
-
-    private JPanel createTransferPanel() {
-        transferPanel.setBackground(new Color(239, 246, 255));
-        transferPanel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(191, 219, 254)),
-                BorderFactory.createEmptyBorder(9, 16, 9, 16)));
-        JPanel labels = UiTheme.panel(null, transferPanel.getBackground());
-        labels.setLayout(new BoxLayout(labels, BoxLayout.Y_AXIS));
-        transferTitle.setFont(UiTheme.BODY_BOLD);
-        transferTitle.setForeground(UiTheme.NAVY);
-        transferDetail.setFont(new Font("Segoe UI", Font.PLAIN, 11));
-        transferDetail.setForeground(UiTheme.SLATE);
-        labels.add(transferTitle);
-        labels.add(transferDetail);
-        transferProgress.setStringPainted(true);
-        transferProgress.setForeground(UiTheme.PRIMARY);
-        transferProgress.setPreferredSize(new Dimension(250, 19));
-        UiTheme.styleSecondaryButton(cancelTransferButton);
-        cancelTransferButton.setForeground(UiTheme.DANGER);
-        JPanel right = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 9, 4), transferPanel.getBackground());
-        right.add(transferProgress);
-        right.add(cancelTransferButton);
-        transferPanel.add(labels, BorderLayout.CENTER);
-        transferPanel.add(right, BorderLayout.EAST);
-        transferPanel.setVisible(false);
-        return transferPanel;
     }
 
     private JPanel createComposer() {
@@ -338,7 +286,6 @@ public final class MainFrame extends JFrame {
         sendButton.addActionListener(event -> sendMessage());
         messageField.addActionListener(event -> sendMessage());
         fileButton.addActionListener(event -> chooseAndSendFile());
-        cancelTransferButton.addActionListener(event -> cancelDisplayedTransfer());
     }
 
     private void updateUsers(List<PeerInfo> users) {
@@ -426,8 +373,11 @@ public final class MainFrame extends JFrame {
                 fileButton.setEnabled(selectedPeer != null);
                 try {
                     TransferHandle handle = get();
-                    outgoingTransfers.put(handle.fileId(), handle);
-                    displayedTransferId = handle.fileId();
+                    FileEntry entry = fileEntries.get(handle.fileId());
+                    if (entry == null || entry.isActive()) {
+                        outgoingTransfers.put(handle.fileId(), handle);
+                    }
+                    renderSelectedConversation();
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 } catch (ExecutionException failure) {
@@ -440,7 +390,8 @@ public final class MainFrame extends JFrame {
     private void addMessage(ChatMessage message) {
         String peerName = message.sender().equals(client.clientName())
                 ? message.receiver() : message.sender();
-        histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(message);
+        histories.computeIfAbsent(peerName, ignored -> new ArrayList<>())
+                .add(new TextEntry(message));
         if (selectedPeer != null && selectedPeer.username().equals(peerName)) {
             messagesPanel.add(createMessageBubble(message));
             messagesPanel.add(Box.createVerticalStrut(8));
@@ -462,8 +413,12 @@ public final class MainFrame extends JFrame {
             messagesPanel.add(empty);
             messagesPanel.add(Box.createVerticalGlue());
         } else {
-            for (ChatMessage message : histories.getOrDefault(peer.username(), List.of())) {
-                messagesPanel.add(createMessageBubble(message));
+            for (ConversationEntry entry : histories.getOrDefault(peer.username(), List.of())) {
+                if (entry instanceof TextEntry textEntry) {
+                    messagesPanel.add(createMessageBubble(textEntry.message()));
+                } else if (entry instanceof FileEntry fileEntry) {
+                    messagesPanel.add(createFileBubble(fileEntry));
+                }
                 messagesPanel.add(Box.createVerticalStrut(8));
             }
             messagesPanel.add(Box.createVerticalGlue());
@@ -509,38 +464,155 @@ public final class MainFrame extends JFrame {
         return row;
     }
 
-    private void showTransferProgress(TransferProgress progress) {
-        displayedTransferId = progress.file().fileId();
-        transferPanel.setVisible(true);
-        transferTitle.setForeground(UiTheme.NAVY);
-        String action = progress.direction() == TransferDirection.SENDING ? "Đang gửi: " : "Đang nhận: ";
-        transferTitle.setText(action + progress.file().fileName());
-        transferProgress.setValue(progress.percent());
-        transferDetail.setText(formatBytes(progress.transferredBytes()) + " / "
-                + formatBytes(progress.file().size()) + "  •  "
-                + formatSpeed(progress.bytesPerSecond()) + "  •  "
-                + formatRemaining(progress.estimatedSeconds()));
-        boolean cancellable = progress.direction() == TransferDirection.SENDING
-                && (progress.state() == TransferState.WAITING
-                || progress.state() == TransferState.TRANSFERRING);
-        cancelTransferButton.setVisible(cancellable);
-        if (progress.state() == TransferState.SUCCESS) {
-            transferTitle.setText("Hoàn tất: " + progress.file().fileName());
-            transferProgress.setValue(100);
-            outgoingTransfers.remove(progress.file().fileId());
-        } else if (progress.state() == TransferState.CANCELLED
-                || progress.state() == TransferState.FAILED) {
-            transferTitle.setForeground(UiTheme.DANGER);
-            outgoingTransfers.remove(progress.file().fileId());
+    private JPanel createFileBubble(FileEntry entry) {
+        boolean mine = entry.direction == TransferDirection.SENDING;
+        Color bubbleColor = mine ? new Color(219, 234, 254) : UiTheme.WHITE;
+        JPanel row = UiTheme.panel(
+                new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0),
+                UiTheme.BACKGROUND);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 190));
+
+        JPanel bubble = UiTheme.panel(null, bubbleColor);
+        bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(mine ? new Color(147, 197, 253) : UiTheme.BORDER),
+                BorderFactory.createEmptyBorder(10, 12, 9, 12)));
+        bubble.setPreferredSize(new Dimension(420, 145));
+
+        JLabel owner = UiTheme.label(
+                mine ? "Bạn đã gửi một file" : entry.file.sender() + " đã gửi một file",
+                new Font("Segoe UI", Font.BOLD, 11), UiTheme.SLATE);
+        JLabel name = UiTheme.label(
+                "FILE  •  " + entry.file.fileName(),
+                new Font("Segoe UI", Font.BOLD, 14), UiTheme.NAVY);
+        JLabel size = UiTheme.label(
+                formatBytes(entry.file.size()),
+                new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED);
+        JProgressBar progressBar = new JProgressBar(0, 100);
+        progressBar.setStringPainted(true);
+        progressBar.setForeground(entry.failureReason == null ? UiTheme.PRIMARY : UiTheme.DANGER);
+        progressBar.setBackground(UiTheme.WHITE);
+        progressBar.setMaximumSize(new Dimension(390, 18));
+        progressBar.setPreferredSize(new Dimension(390, 18));
+
+        TransferProgress progress = entry.progress;
+        int percent = progress == null ? 0 : progress.percent();
+        progressBar.setValue(percent);
+        progressBar.setString(percent + "%");
+        String statusText;
+        Color statusColor = UiTheme.SLATE;
+        if (entry.failureReason != null) {
+            statusText = "Thất bại: " + entry.failureReason;
+            statusColor = UiTheme.DANGER;
+            progressBar.setString("Lỗi");
+        } else if (progress == null || progress.state() == TransferState.WAITING) {
+            statusText = mine ? "Đang chuẩn bị gửi..." : "Đang chuẩn bị nhận...";
+        } else if (progress.state() == TransferState.SUCCESS) {
+            statusText = mine
+                    ? "Đã gửi thành công"
+                    : entry.savedPath == null
+                            ? "Đã nhận thành công"
+                            : "Đã lưu: " + entry.savedPath.getFileName();
+            statusColor = UiTheme.SUCCESS;
+            progressBar.setValue(100);
+            progressBar.setString("100%");
+        } else if (progress.state() == TransferState.CANCELLED) {
+            statusText = "Đã hủy truyền file";
+            statusColor = UiTheme.DANGER;
+        } else {
+            statusText = formatBytes(progress.transferredBytes()) + " / "
+                    + formatBytes(entry.file.size()) + "  •  "
+                    + formatSpeed(progress.bytesPerSecond()) + "  •  "
+                    + formatRemaining(progress.estimatedSeconds());
         }
-        transferPanel.revalidate();
+        JLabel status = UiTheme.label(
+                "<html><div style='width:380px'>" + escapeHtml(statusText) + "</div></html>",
+                new Font("Segoe UI", Font.PLAIN, 11), statusColor);
+
+        JPanel footer = UiTheme.panel(new BorderLayout(), bubbleColor);
+        JLabel time = UiTheme.label(
+                MESSAGE_TIME.format(entry.createdAt),
+                new Font("Segoe UI", Font.PLAIN, 10), UiTheme.MUTED);
+        footer.add(time, BorderLayout.WEST);
+        TransferHandle handle = outgoingTransfers.get(entry.file.fileId());
+        if (mine && entry.isActive() && handle != null) {
+            JButton cancel = new JButton("HỦY");
+            UiTheme.styleSecondaryButton(cancel);
+            cancel.setForeground(UiTheme.DANGER);
+            cancel.addActionListener(event -> {
+                handle.cancel();
+                cancel.setEnabled(false);
+                cancel.setText("ĐANG HỦY...");
+            });
+            footer.add(cancel, BorderLayout.EAST);
+        }
+
+        bubble.add(owner);
+        bubble.add(Box.createVerticalStrut(5));
+        bubble.add(name);
+        bubble.add(size);
+        bubble.add(Box.createVerticalStrut(8));
+        bubble.add(progressBar);
+        bubble.add(Box.createVerticalStrut(5));
+        bubble.add(status);
+        bubble.add(Box.createVerticalStrut(4));
+        bubble.add(footer);
+        row.add(bubble);
+        return row;
     }
 
-    private void cancelDisplayedTransfer() {
-        TransferHandle handle = outgoingTransfers.get(displayedTransferId);
-        if (handle != null) {
-            handle.cancel();
-            cancelTransferButton.setEnabled(false);
+    private void updateFileEntry(TransferProgress progress) {
+        FileEntry entry = fileEntries.get(progress.file().fileId());
+        if (entry == null) {
+            entry = new FileEntry(progress.file(), progress.direction(), Instant.now());
+            fileEntries.put(progress.file().fileId(), entry);
+            String peerName = progress.direction() == TransferDirection.SENDING
+                    ? progress.file().receiver() : progress.file().sender();
+            histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
+        }
+        entry.progress = progress;
+        if (!entry.isActive()) {
+            outgoingTransfers.remove(progress.file().fileId());
+        }
+        renderFileConversation(entry);
+    }
+
+    private void markFileCompleted(FileInfo file, Path savedPath) {
+        FileEntry entry = fileEntries.get(file.fileId());
+        if (entry != null) {
+            entry.savedPath = savedPath;
+            renderFileConversation(entry);
+        }
+    }
+
+    private void markFileFailed(FileInfo file, String reason) {
+        FileEntry entry = fileEntries.get(file.fileId());
+        if (entry == null) {
+            TransferDirection direction = file.sender().equals(client.clientName())
+                    ? TransferDirection.SENDING : TransferDirection.RECEIVING;
+            entry = new FileEntry(file, direction, Instant.now());
+            fileEntries.put(file.fileId(), entry);
+            String peerName = direction == TransferDirection.SENDING
+                    ? file.receiver() : file.sender();
+            histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
+        }
+        entry.failureReason = reason;
+        outgoingTransfers.remove(file.fileId());
+        renderFileConversation(entry);
+    }
+
+    private void renderFileConversation(FileEntry entry) {
+        PeerInfo peer = selectedPeer;
+        String peerName = entry.direction == TransferDirection.SENDING
+                ? entry.file.receiver() : entry.file.sender();
+        if (peer != null && peer.username().equals(peerName)) {
+            renderHistory();
+        }
+    }
+
+    private void renderSelectedConversation() {
+        if (selectedPeer != null) {
+            renderHistory();
         }
     }
 
@@ -619,6 +691,35 @@ public final class MainFrame extends JFrame {
         return seconds < 0 ? "Đang tính..." : "Còn " + seconds + " giây";
     }
 
+    private sealed interface ConversationEntry permits TextEntry, FileEntry {
+    }
+
+    private record TextEntry(ChatMessage message) implements ConversationEntry {
+    }
+
+    private static final class FileEntry implements ConversationEntry {
+        private final FileInfo file;
+        private final TransferDirection direction;
+        private final Instant createdAt;
+        private TransferProgress progress;
+        private Path savedPath;
+        private String failureReason;
+
+        private FileEntry(FileInfo file, TransferDirection direction, Instant createdAt) {
+            this.file = file;
+            this.direction = direction;
+            this.createdAt = createdAt;
+        }
+
+        private boolean isActive() {
+            if (failureReason != null || progress == null) {
+                return failureReason == null;
+            }
+            return progress.state() == TransferState.WAITING
+                    || progress.state() == TransferState.TRANSFERRING;
+        }
+    }
+
     private static final class UserRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(
@@ -645,7 +746,7 @@ public final class MainFrame extends JFrame {
                     new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED));
             row.add(avatar, BorderLayout.WEST);
             row.add(text, BorderLayout.CENTER);
-            row.add(UiTheme.label("●", new Font("Segoe UI", Font.BOLD, 10), UiTheme.SUCCESS),
+            row.add(UiTheme.label("●", new Font("Segoe UI", Font.BOLD, 16), UiTheme.SUCCESS),
                     BorderLayout.EAST);
             return row;
         }

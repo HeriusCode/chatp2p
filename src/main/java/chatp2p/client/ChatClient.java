@@ -16,6 +16,9 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Client facade for the central control channel and direct P2P chat channel. */
@@ -26,6 +29,12 @@ public final class ChatClient implements AutoCloseable {
             new AtomicReference<>(ConnectionState.DISCONNECTED);
     private final CopyOnWriteArrayList<ClientEventListener> listeners =
             new CopyOnWriteArrayList<>();
+    private final ScheduledExecutorService heartbeatExecutor =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "server-heartbeat");
+                thread.setDaemon(true);
+                return thread;
+            });
     private volatile ServerConnection connection;
     private volatile PeerServer peerServer;
     private volatile FileTransferManager fileTransferManager;
@@ -70,6 +79,8 @@ public final class ChatClient implements AutoCloseable {
             clientName = requestedClientName;
             state.set(ConnectionState.CONNECTED);
             refreshUsers();
+            heartbeatExecutor.scheduleAtFixedRate(
+                    this::sendHeartbeat, 20, 30, TimeUnit.SECONDS);
         } catch (IOException | RuntimeException failure) {
             newConnection.close();
             newPeerServer.close();
@@ -182,6 +193,7 @@ public final class ChatClient implements AutoCloseable {
         fileTransferManager = null;
         onlineUsers = List.of();
         state.set(ConnectionState.DISCONNECTED);
+        heartbeatExecutor.shutdownNow();
     }
 
     private void handleServerEvent(ProtocolMessage message) {
@@ -261,6 +273,18 @@ public final class ChatClient implements AutoCloseable {
     private void notifyConnectionError(String message) {
         for (ClientEventListener listener : listeners) {
             listener.onConnectionError(message);
+        }
+    }
+
+    private void sendHeartbeat() {
+        if (state.get() != ConnectionState.CONNECTED) {
+            return;
+        }
+        try {
+            ping();
+        } catch (IOException failure) {
+            notifyConnectionError("Mất kết nối tới Server: " + failure.getMessage());
+            close();
         }
     }
 

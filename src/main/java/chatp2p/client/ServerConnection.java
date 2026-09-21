@@ -28,7 +28,6 @@ import java.util.function.Consumer;
 /** Owns one TCP connection and its single background reader. */
 final class ServerConnection implements AutoCloseable {
     private static final int CONNECT_TIMEOUT_MILLIS = 5_000;
-    private static final int READ_TIMEOUT_MILLIS = 120_000;
 
     private final Socket socket = new Socket();
     private final Map<UUID, CompletableFuture<ProtocolMessage>> pending = new ConcurrentHashMap<>();
@@ -47,7 +46,9 @@ final class ServerConnection implements AutoCloseable {
         socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS);
         socket.setKeepAlive(true);
         socket.setTcpNoDelay(true);
-        socket.setSoTimeout(READ_TIMEOUT_MILLIS);
+        // The control connection is long-lived and may legitimately be idle.
+        // Liveness is checked by ChatClient's application-level PING/PONG heartbeat.
+        socket.setSoTimeout(0);
         input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
         output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         open.set(true);
@@ -151,4 +152,3 @@ final class ServerConnection implements AutoCloseable {
         }
     }
 }
-
