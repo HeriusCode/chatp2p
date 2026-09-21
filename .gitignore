@@ -1,0 +1,15 @@
+target/
+build/
+*.class
+*.log
+.idea/
+.vscode/
+*.iml
+data/users.dat
+data/chat_history/*
+data/received_files/*
+data/logs/*
+!data/chat_history/.gitkeep
+!data/received_files/.gitkeep
+!data/logs/.gitkeep
+
