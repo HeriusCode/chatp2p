@@ -12,14 +12,21 @@ import chatp2p.model.TransferProgress;
 import chatp2p.model.TransferState;
 
 import java.awt.BorderLayout;
+import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.GridBagLayout;
+import java.awt.RenderingHints;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -381,7 +388,7 @@ public final class MainFrame extends JFrame {
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 } catch (ExecutionException failure) {
-                    showError(friendlyMessage(failure.getCause()));
+                    addFailedFileAttempt(peer, file, friendlyMessage(failure.getCause()));
                 }
             }
         }.execute();
@@ -477,7 +484,7 @@ public final class MainFrame extends JFrame {
         bubble.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(mine ? new Color(147, 197, 253) : UiTheme.BORDER),
                 BorderFactory.createEmptyBorder(10, 12, 9, 12)));
-        bubble.setPreferredSize(new Dimension(420, 145));
+        bubble.setPreferredSize(new Dimension(420, 150));
 
         JLabel owner = UiTheme.label(
                 mine ? "Bạn đã gửi một file" : entry.file.sender() + " đã gửi một file",
@@ -492,8 +499,8 @@ public final class MainFrame extends JFrame {
         progressBar.setStringPainted(true);
         progressBar.setForeground(entry.failureReason == null ? UiTheme.PRIMARY : UiTheme.DANGER);
         progressBar.setBackground(UiTheme.WHITE);
-        progressBar.setMaximumSize(new Dimension(390, 18));
-        progressBar.setPreferredSize(new Dimension(390, 18));
+        progressBar.setMaximumSize(new Dimension(320, 18));
+        progressBar.setPreferredSize(new Dimension(320, 18));
 
         TransferProgress progress = entry.progress;
         int percent = progress == null ? 0 : progress.percent();
@@ -501,7 +508,13 @@ public final class MainFrame extends JFrame {
         progressBar.setString(percent + "%");
         String statusText;
         Color statusColor = UiTheme.SLATE;
-        if (entry.failureReason != null) {
+        if (entry.downloadError != null) {
+            statusText = "Không thể tải xuống: " + entry.downloadError;
+            statusColor = UiTheme.DANGER;
+        } else if (entry.downloadedPath != null) {
+            statusText = "Đã tải xuống: " + entry.downloadedPath.getFileName();
+            statusColor = UiTheme.SUCCESS;
+        } else if (entry.failureReason != null) {
             statusText = "Thất bại: " + entry.failureReason;
             statusColor = UiTheme.DANGER;
             progressBar.setString("Lỗi");
@@ -526,8 +539,36 @@ public final class MainFrame extends JFrame {
                     + formatRemaining(progress.estimatedSeconds());
         }
         JLabel status = UiTheme.label(
-                "<html><div style='width:380px'>" + escapeHtml(statusText) + "</div></html>",
+                "<html><div style='width:320px'>" + escapeHtml(statusText) + "</div></html>",
                 new Font("Segoe UI", Font.PLAIN, 11), statusColor);
+
+        JPanel details = UiTheme.panel(null, bubbleColor);
+        details.setLayout(new BoxLayout(details, BoxLayout.Y_AXIS));
+        details.add(name);
+        details.add(size);
+        details.add(Box.createVerticalStrut(8));
+        details.add(progressBar);
+        details.add(Box.createVerticalStrut(5));
+        details.add(status);
+
+        JPanel fileBody = UiTheme.panel(new BorderLayout(10, 0), bubbleColor);
+        fileBody.add(details, BorderLayout.CENTER);
+        boolean canDownload = !mine
+                && entry.savedPath != null
+                && progress != null
+                && progress.state() == TransferState.SUCCESS;
+        if (canDownload) {
+            DownloadIconButton download = new DownloadIconButton();
+            download.setEnabled(!entry.downloading);
+            download.setToolTipText(entry.downloading
+                    ? "Đang tải xuống..."
+                    : "Tải xuống " + entry.file.fileName());
+            download.addActionListener(event -> downloadReceivedFile(entry));
+            JPanel iconHolder = UiTheme.panel(new GridBagLayout(), bubbleColor);
+            iconHolder.setPreferredSize(new Dimension(48, 72));
+            iconHolder.add(download);
+            fileBody.add(iconHolder, BorderLayout.EAST);
+        }
 
         JPanel footer = UiTheme.panel(new BorderLayout(), bubbleColor);
         JLabel time = UiTheme.label(
@@ -549,12 +590,7 @@ public final class MainFrame extends JFrame {
 
         bubble.add(owner);
         bubble.add(Box.createVerticalStrut(5));
-        bubble.add(name);
-        bubble.add(size);
-        bubble.add(Box.createVerticalStrut(8));
-        bubble.add(progressBar);
-        bubble.add(Box.createVerticalStrut(5));
-        bubble.add(status);
+        bubble.add(fileBody);
         bubble.add(Box.createVerticalStrut(4));
         bubble.add(footer);
         row.add(bubble);
@@ -596,9 +632,93 @@ public final class MainFrame extends JFrame {
                     ? file.receiver() : file.sender();
             histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
         }
-        entry.failureReason = reason;
+        if (entry.progress == null || entry.progress.state() != TransferState.CANCELLED) {
+            entry.failureReason = reason;
+        }
         outgoingTransfers.remove(file.fileId());
         renderFileConversation(entry);
+    }
+
+    private void addFailedFileAttempt(PeerInfo peer, Path file, String reason) {
+        long size = 0;
+        try {
+            size = Files.size(file);
+        } catch (IOException ignored) {
+            // The reason shown in the card already explains why the file cannot be sent.
+        }
+        FileInfo info = new FileInfo(
+                UUID.randomUUID(), file.getFileName().toString(), size,
+                client.clientName(), peer.username());
+        FileEntry entry = new FileEntry(info, TransferDirection.SENDING, Instant.now());
+        entry.failureReason = reason;
+        fileEntries.put(info.fileId(), entry);
+        histories.computeIfAbsent(peer.username(), ignored -> new ArrayList<>()).add(entry);
+        renderFileConversation(entry);
+    }
+
+    private void downloadReceivedFile(FileEntry entry) {
+        Path source = entry.savedPath;
+        if (source == null || !Files.isRegularFile(source)) {
+            entry.downloadError = "File nhận không còn tồn tại";
+            renderFileConversation(entry);
+            return;
+        }
+
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Tải xuống " + entry.file.fileName());
+        chooser.setSelectedFile(Path.of(entry.file.fileName()).toFile());
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+
+        Path requestedTarget = chooser.getSelectedFile().toPath().toAbsolutePath().normalize();
+        entry.downloading = true;
+        entry.downloadError = null;
+        renderFileConversation(entry);
+        new SwingWorker<Path, Void>() {
+            @Override
+            protected Path doInBackground() throws Exception {
+                Path normalizedSource = source.toAbsolutePath().normalize();
+                if (normalizedSource.equals(requestedTarget)) {
+                    return normalizedSource;
+                }
+                Path target = availableDownloadTarget(requestedTarget);
+                Files.copy(normalizedSource, target);
+                return target;
+            }
+
+            @Override
+            protected void done() {
+                entry.downloading = false;
+                try {
+                    entry.downloadedPath = get();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    entry.downloadError = "Đã dừng tải xuống";
+                } catch (ExecutionException failure) {
+                    entry.downloadError = friendlyMessage(failure.getCause());
+                }
+                renderFileConversation(entry);
+            }
+        }.execute();
+    }
+
+    private static Path availableDownloadTarget(Path requested) throws IOException {
+        if (!Files.exists(requested)) {
+            return requested;
+        }
+        Path parent = requested.getParent();
+        String fileName = requested.getFileName().toString();
+        int dot = fileName.lastIndexOf('.');
+        String base = dot > 0 ? fileName.substring(0, dot) : fileName;
+        String extension = dot > 0 ? fileName.substring(dot) : "";
+        for (int index = 1; index <= 10_000; index++) {
+            Path candidate = parent.resolve(base + " (" + index + ")" + extension);
+            if (!Files.exists(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IOException("Không tìm được tên file trống trong thư mục đã chọn");
     }
 
     private void renderFileConversation(FileEntry entry) {
@@ -703,7 +823,10 @@ public final class MainFrame extends JFrame {
         private final Instant createdAt;
         private TransferProgress progress;
         private Path savedPath;
+        private Path downloadedPath;
         private String failureReason;
+        private String downloadError;
+        private boolean downloading;
 
         private FileEntry(FileInfo file, TransferDirection direction, Instant createdAt) {
             this.file = file;
@@ -717,6 +840,61 @@ public final class MainFrame extends JFrame {
             }
             return progress.state() == TransferState.WAITING
                     || progress.state() == TransferState.TRANSFERRING;
+        }
+    }
+
+    /** Compact circular download control that does not depend on an icon font. */
+    private static final class DownloadIconButton extends JButton {
+        private static final int BUTTON_SIZE = 42;
+
+        private DownloadIconButton() {
+            setPreferredSize(new Dimension(BUTTON_SIZE, BUTTON_SIZE));
+            setMinimumSize(new Dimension(BUTTON_SIZE, BUTTON_SIZE));
+            setMaximumSize(new Dimension(BUTTON_SIZE, BUTTON_SIZE));
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            getAccessibleContext().setAccessibleName("Tải file xuống");
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_ANTIALIASING,
+                        RenderingHints.VALUE_ANTIALIAS_ON);
+                int diameter = Math.min(getWidth(), getHeight()) - 4;
+                int left = (getWidth() - diameter) / 2;
+                int top = (getHeight() - diameter) / 2;
+                Color circle = !isEnabled()
+                        ? UiTheme.MUTED
+                        : getModel().isPressed() ? UiTheme.PRIMARY_DARK : UiTheme.PRIMARY;
+                canvas.setColor(circle);
+                canvas.fillOval(left, top, diameter, diameter);
+
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                canvas.setColor(UiTheme.WHITE);
+                canvas.setStroke(new BasicStroke(
+                        2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                canvas.drawLine(centerX, centerY - 9, centerX, centerY + 5);
+                canvas.drawLine(centerX - 6, centerY, centerX, centerY + 6);
+                canvas.drawLine(centerX + 6, centerY, centerX, centerY + 6);
+                canvas.drawLine(centerX - 8, centerY + 10, centerX + 8, centerY + 10);
+            } finally {
+                canvas.dispose();
+            }
+        }
+
+        @Override
+        public boolean contains(int x, int y) {
+            double radius = Math.min(getWidth(), getHeight()) / 2.0;
+            double deltaX = x - getWidth() / 2.0;
+            double deltaY = y - getHeight() / 2.0;
+            return deltaX * deltaX + deltaY * deltaY <= radius * radius;
         }
     }
 

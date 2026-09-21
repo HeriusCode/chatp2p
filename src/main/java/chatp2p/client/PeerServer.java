@@ -91,6 +91,7 @@ final class PeerServer implements AutoCloseable {
     }
 
     private void handle(Socket socket) {
+        boolean fileTransfer = false;
         try (socket;
              DataInputStream input = new DataInputStream(
                      new BufferedInputStream(socket.getInputStream()));
@@ -113,14 +114,17 @@ final class PeerServer implements AutoCloseable {
                         .field("status", "RECEIVED")
                         .build());
             } else if (request.type() == MessageType.FILE_REQUEST) {
-                // A human may need time to review the incoming-file dialog.
+                fileTransfer = true;
                 socket.setSoTimeout(0);
                 fileTransferManager.receive(request, input, output);
             } else {
                 sendError(output, request, "UNSUPPORTED_PEER_MESSAGE");
             }
         } catch (Exception failure) {
-            errorListener.accept("Peer connection error: " + failure.getMessage());
+            // File-transfer failures are already rendered inside the conversation.
+            if (!fileTransfer) {
+                errorListener.accept("Peer connection error: " + failure.getMessage());
+            }
         }
     }
 
