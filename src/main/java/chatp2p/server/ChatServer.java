@@ -27,6 +27,7 @@ public final class ChatServer implements AutoCloseable {
     private final ExecutorService clientPool;
     private final Logger logger;
     private final ServerEventListener eventListener;
+    private final UserManager userManager;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong connectionIds = new AtomicLong();
     private final CountDownLatch started = new CountDownLatch(1);
@@ -62,6 +63,7 @@ public final class ChatServer implements AutoCloseable {
         });
         this.logger = Objects.requireNonNull(logger, "logger");
         this.eventListener = Objects.requireNonNull(eventListener, "eventListener");
+        this.userManager = new UserManager(logger);
     }
 
     /** Binds the port and runs the accept loop until close() is called. */
@@ -96,7 +98,8 @@ public final class ChatServer implements AutoCloseable {
                             "TCP connection accepted"));
                     clientPool.execute(() -> {
                         try {
-                            new ClientHandler(connectionId, clientSocket, logger, eventListener).run();
+                            new ClientHandler(
+                                    connectionId, clientSocket, logger, eventListener, userManager).run();
                         } finally {
                             activeSockets.remove(clientSocket);
                         }

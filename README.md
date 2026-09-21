@@ -1,11 +1,12 @@
-# ChatP2P - Phase 1
+# ChatP2P - TCP Control + P2P Chat/File
 
-Đây là nền móng của đồ án chat theo kiến trúc **hybrid Client-Server + P2P**.
-Phase 1 chỉ triển khai kết nối điều khiển TCP giữa client và central server, bắt tay
-`HELLO/HELLO_ACK`, kiểm tra sống `PING/PONG`, ngắt kết nối có kiểm soát và logging.
+Ứng dụng chat theo kiến trúc **hybrid Client-Server + P2P**. Central Server quản lý
+kết nối, danh sách online và peer discovery; chat và file được truyền trực tiếp
+giữa hai client qua TCP.
 
-> Chưa có đăng ký, đăng nhập, chat, peer discovery hoặc truyền file. Các chức năng
-> đó thuộc các phase sau và không được giả lập trong mã nguồn Phase 1.
+Đã có `HELLO/HELLO_ACK`, `PING/PONG`, danh sách online, `CONNECT_REQUEST/PEER_INFO`,
+chat 1-1 P2P, gửi/nhận file, Accept/Reject, tiến trình, Cancel và SHA-256. Đăng ký
+và mật khẩu băm chưa được triển khai; tên client hiện đóng vai trò định danh online.
 
 ## 1. Quyết định kiến trúc
 
@@ -73,8 +74,9 @@ Chạy giao diện Swing client ở terminal khác:
 .\scripts\run-client.ps1
 ```
 
-Nhập Server Host, Server Port và tên client trên cửa sổ kết nối. Sau khi kết nối,
-nút `Kiểm tra Ping` dùng để đo round-trip time đến server.
+Nhập Server Host, Server Port và tên client trên cửa sổ kết nối. Mở hai client với
+hai tên khác nhau; chọn người dùng online để chat hoặc gửi file. File nhận được lưu
+tại `data/received_files/` và tự đổi tên nếu tên file đã tồn tại.
 
 Chế độ console vẫn được giữ để kiểm tra nhanh hoặc chạy trên máy không có GUI:
 

@@ -17,7 +17,7 @@ public final class Protocol {
     public static final int MAGIC = 0x43503250; // ASCII "CP2P"
     public static final int VERSION = 1;
     public static final int MAX_FRAME_BYTES = 256 * 1024;
-    public static final int MAX_FIELDS = 64;
+    public static final int MAX_FIELDS = 256;
     public static final int MAX_KEY_BYTES = 128;
     public static final int MAX_VALUE_BYTES = 64 * 1024;
 
@@ -121,4 +121,3 @@ public final class Protocol {
         return new String(encoded, StandardCharsets.UTF_8);
     }
 }
-

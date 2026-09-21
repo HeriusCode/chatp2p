@@ -25,19 +25,23 @@ final class ClientHandler implements Runnable {
     private final Socket socket;
     private final Logger logger;
     private final ServerEventListener eventListener;
+    private final UserManager userManager;
     private final String remoteAddress;
     private String clientName;
     private boolean handshakeComplete;
+    private volatile DataOutputStream activeOutput;
 
     ClientHandler(
             long connectionId,
             Socket socket,
             Logger logger,
-            ServerEventListener eventListener) {
+            ServerEventListener eventListener,
+            UserManager userManager) {
         this.connectionId = connectionId;
         this.socket = socket;
         this.logger = logger;
         this.eventListener = eventListener;
+        this.userManager = userManager;
         this.remoteAddress = socket.getRemoteSocketAddress().toString();
     }
 
@@ -49,6 +53,7 @@ final class ClientHandler implements Runnable {
                      new BufferedInputStream(clientSocket.getInputStream()));
              DataOutputStream output = new DataOutputStream(
                      new BufferedOutputStream(clientSocket.getOutputStream()))) {
+            activeOutput = output;
             while (!clientSocket.isClosed()) {
                 ProtocolMessage message = Protocol.readMessage(input);
                 if (!process(message, output)) {
@@ -70,6 +75,11 @@ final class ClientHandler implements Runnable {
             logger.log(Level.SEVERE, label() + " unexpected error", failure);
             publish(ServerEvent.Type.ERROR, "Unexpected error: " + failure.getMessage());
         } finally {
+            userManager.unregister(clientName, this);
+            activeOutput = null;
+            if (handshakeComplete) {
+                userManager.broadcastUserList();
+            }
             logger.info(label() + " handler stopped");
             publish(ServerEvent.Type.CLIENT_DISCONNECTED, "Client disconnected");
         }
@@ -88,14 +98,23 @@ final class ClientHandler implements Runnable {
                         .field("sentAt", valueOrEmpty(message.field("sentAt")))
                         .field("serverTime", Instant.now().toString())
                         .build();
-                Protocol.writeMessage(output, response);
+                send(response);
                 yield true;
             }
             case DISCONNECT -> {
                 logger.info(label() + " requested disconnect");
                 yield false;
             }
-            case HELLO_ACK, PONG, ERROR -> {
+            case GET_USERS -> {
+                sendUserList(message);
+                yield true;
+            }
+            case CONNECT_REQUEST -> {
+                sendPeerInfo(message);
+                yield true;
+            }
+            case HELLO_ACK, PONG, ERROR, USER_LIST, PEER_INFO, CHAT,
+                    FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL -> {
                 sendError(output, message, "UNEXPECTED_MESSAGE",
                         "Server cannot accept " + message.type() + " from a client");
                 yield true;
@@ -117,16 +136,62 @@ final class ClientHandler implements Runnable {
             return false;
         }
 
+        int peerPort;
+        try {
+            peerPort = Integer.parseInt(message.requiredField("peerPort"));
+        } catch (NumberFormatException invalidPort) {
+            sendError(output, message, "INVALID_PEER_PORT", "Peer port must be a number");
+            return false;
+        }
+        if (peerPort < 1 || peerPort > 65_535) {
+            sendError(output, message, "INVALID_PEER_PORT", "Peer port must be between 1 and 65535");
+            return false;
+        }
+
+        String peerHost = socket.getInetAddress().getHostAddress();
+        if (!userManager.register(requestedName, peerHost, peerPort, this)) {
+            sendError(output, message, "USERNAME_ONLINE", "This username is already online");
+            return false;
+        }
+
         clientName = requestedName;
         handshakeComplete = true;
         ProtocolMessage response = ProtocolMessage.responseTo(message, MessageType.HELLO_ACK)
                 .field("message", "Connected to ChatP2P control server")
                 .field("remoteAddress", socket.getRemoteSocketAddress().toString())
                 .build();
-        Protocol.writeMessage(output, response);
+        send(response);
         logger.info(label() + " handshake completed");
         publish(ServerEvent.Type.HANDSHAKE_COMPLETED, "Handshake completed");
+        userManager.broadcastUserList();
         return true;
+    }
+
+    private void sendUserList(ProtocolMessage request) throws IOException {
+        java.util.List<UserManager.OnlineSession> users = userManager.snapshot();
+        ProtocolMessage.Builder builder = ProtocolMessage.responseTo(request, MessageType.USER_LIST)
+                .field("count", Integer.toString(users.size()));
+        for (int index = 0; index < users.size(); index++) {
+            UserManager.OnlineSession user = users.get(index);
+            builder.field("user." + index + ".name", user.username())
+                    .field("user." + index + ".host", user.peerHost())
+                    .field("user." + index + ".port", Integer.toString(user.peerPort()));
+        }
+        send(builder.build());
+    }
+
+    private void sendPeerInfo(ProtocolMessage request) throws IOException {
+        String target = request.requiredField("username");
+        UserManager.OnlineSession peer = userManager.find(target);
+        if (peer == null) {
+            sendError(output(), request, "USER_OFFLINE", "User is not online: " + target);
+            return;
+        }
+        send(ProtocolMessage.responseTo(request, MessageType.PEER_INFO)
+                .field("username", peer.username())
+                .field("host", peer.peerHost())
+                .field("port", Integer.toString(peer.peerPort()))
+                .build());
     }
 
     private void sendError(
@@ -136,7 +201,28 @@ final class ClientHandler implements Runnable {
                 .field("code", code)
                 .field("message", description)
                 .build();
-        Protocol.writeMessage(output, error);
+        synchronized (output) {
+            Protocol.writeMessage(output, error);
+        }
+    }
+
+    void send(ProtocolMessage message) throws IOException {
+        DataOutputStream current = output();
+        synchronized (current) {
+            Protocol.writeMessage(current, message);
+        }
+    }
+
+    boolean isAvailable() {
+        return activeOutput != null && !socket.isClosed();
+    }
+
+    private DataOutputStream output() throws IOException {
+        DataOutputStream current = activeOutput;
+        if (current == null) {
+            throw new IOException("Client output stream is not ready");
+        }
+        return current;
     }
 
     private String label() {
