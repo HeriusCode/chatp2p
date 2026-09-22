@@ -524,8 +524,8 @@ public final class MainFrame extends JFrame {
             statusText = mine
                     ? "Đã gửi thành công"
                     : entry.savedPath == null
-                            ? "Đã nhận thành công"
-                            : "Đã lưu: " + entry.savedPath.getFileName();
+                        ? "Đã nhận thành công"
+                        : "Đã nhận thành công:";
             statusColor = UiTheme.SUCCESS;
             progressBar.setValue(100);
             progressBar.setString("100%");
