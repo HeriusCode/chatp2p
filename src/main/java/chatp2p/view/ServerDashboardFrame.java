@@ -22,6 +22,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -47,7 +48,7 @@ public final class ServerDashboardFrame extends JFrame {
     private static final DateTimeFormatter TIME_FORMAT =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
 
-    private final JTextField serverIpField = new JTextField(detectServerIp());
+    private final JTextField serverIpField = new JTextField("0.0.0.0");
     private final JTextField portField = new JTextField("5000");
     private final JButton startButton = new JButton("START");
     private final JButton stopButton = new JButton("STOP");
@@ -400,6 +401,7 @@ public final class ServerDashboardFrame extends JFrame {
     }
 
     private void setStartingUi() {
+        serverIpField.setText("0.0.0.0");
         portField.setEnabled(false);
         startButton.setEnabled(false);
         startButton.setText("STARTING...");
@@ -411,6 +413,7 @@ public final class ServerDashboardFrame extends JFrame {
     }
 
     private void setRunningUi(boolean running) {
+        serverIpField.setText(running ? detectWifiServerIp() : "0.0.0.0");
         portField.setEnabled(!running);
         startButton.setEnabled(!running);
         startButton.setText("START");
@@ -452,26 +455,66 @@ public final class ServerDashboardFrame extends JFrame {
         }
     }
 
-    private static String detectServerIp() {
+    private static String detectWifiServerIp() {
+        String physicalFallback = null;
         try {
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
             while (interfaces.hasMoreElements()) {
                 NetworkInterface network = interfaces.nextElement();
-                if (!network.isUp() || network.isLoopback() || network.isVirtual()) {
+                if (!network.isUp() || network.isLoopback() || network.isVirtual()
+                        || isVirtualOrTunnel(network)) {
                     continue;
                 }
                 Enumeration<InetAddress> addresses = network.getInetAddresses();
                 while (addresses.hasMoreElements()) {
                     InetAddress address = addresses.nextElement();
-                    if (address instanceof Inet4Address && address.isSiteLocalAddress()) {
-                        return address.getHostAddress();
+                    if (!(address instanceof Inet4Address)
+                            || !address.isSiteLocalAddress()
+                            || address.isLoopbackAddress()
+                            || address.isLinkLocalAddress()) {
+                        continue;
+                    }
+                    String ipv4 = address.getHostAddress();
+                    if (isWifi(network)) {
+                        return ipv4;
+                    }
+                    if (physicalFallback == null) {
+                        physicalFallback = ipv4;
                     }
                 }
             }
-            return InetAddress.getLocalHost().getHostAddress();
-        } catch (SocketException | java.net.UnknownHostException failure) {
-            return "127.0.0.1";
+        } catch (SocketException failure) {
+            return "0.0.0.0";
         }
+        return physicalFallback == null ? "0.0.0.0" : physicalFallback;
+    }
+
+    private static boolean isWifi(NetworkInterface network) {
+        String identity = interfaceIdentity(network);
+        return identity.contains("wi-fi")
+                || identity.contains("wifi")
+                || identity.contains("wireless")
+                || identity.contains("wlan")
+                || identity.contains("802.11");
+    }
+
+    private static boolean isVirtualOrTunnel(NetworkInterface network) {
+        String identity = interfaceIdentity(network);
+        return identity.contains("vmware")
+                || identity.contains("vmnet")
+                || identity.contains("virtual")
+                || identity.contains("vbox")
+                || identity.contains("hyper-v")
+                || identity.contains("wsl")
+                || identity.contains("docker")
+                || identity.contains("vpn")
+                || identity.contains("tunnel")
+                || identity.contains("loopback")
+                || identity.contains("bluetooth");
+    }
+
+    private static String interfaceIdentity(NetworkInterface network) {
+        return (network.getName() + " " + network.getDisplayName()).toLowerCase(Locale.ROOT);
     }
 
     private static String clientSuffix(String clientName, String remoteAddress) {
