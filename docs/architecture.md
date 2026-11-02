@@ -1,21 +1,27 @@
 # Phân tích và thiết kế kiến trúc
 
-## Phạm vi Phase 1
+## Phạm vi hiện tại
 
-Phase 1 tạo nền tảng kết nối TCP có framing rõ ràng, server xử lý đồng thời nhiều
-client bằng thread pool, client có một luồng đọc mạng riêng, logging và shutdown
-an toàn. Không triển khai nghiệp vụ của Phase 2 trở đi.
+Ứng dụng đã có control channel TCP, xác thực tài khoản, danh sách online, peer
+discovery, chat/file/Audio/Video P2P và chat nhóm. Server xử lý đồng thời nhiều client bằng
+thread pool; client có luồng đọc mạng riêng, logging và shutdown an toàn.
 
 ## Phân chia trách nhiệm toàn hệ thống
 
 - **Central Server:** xác thực và quản lý user, trạng thái online, peer discovery,
-  signaling, logging. Server không mang dữ liệu file khi P2P hoạt động.
+  membership/chat nhóm, signaling và logging. Server không mang chat riêng hoặc
+  dữ liệu file khi P2P hoạt động.
 - **Client:** GUI, kết nối điều khiển tới server, lịch sử chat cục bộ, peer listener,
   kết nối trực tiếp và quản lý truyền file.
-- **P2P channel:** TCP socket trực tiếp giữa hai client cho chat/file. Binary file
+- **P2P channel:** TCP socket trực tiếp giữa hai client cho chat/file/media. Binary file
   được stream theo chunk; không chuyển file thành String và không chạy trên EDT.
-
-Phase 1 chỉ hiện thực control channel trong vùng nét liền:
+- **Audio:** Java Sound thu WAV PCM mono 16 kHz; file WAV đi qua P2P channel và
+  được phát/dừng ngay trong client bằng `Clip`.
+- **Video:** file MP4/MOV/AVI/MKV/WEBM đi qua P2P channel và được mở bằng trình
+  phát mặc định. Chưa có gọi video thời gian thực do Java SE không có webcam/codec.
+- **UDP Broadcast:** client phát discovery trên cổng `5050`; server trả lời endpoint TCP.
+- **UDP Multicast:** group `239.255.42.99:5051` phát chat nhóm trong LAN. Server
+  vẫn xác thực thành viên và phân phối fallback; UUID ngăn hiển thị trùng.
 
 ```text
 ClientMain -> ChatClient -> ServerConnection == TCP == ChatServer -> ClientHandler
@@ -29,17 +35,17 @@ ClientMain -> ChatClient -> ServerConnection == TCP == ChatServer -> ClientHandl
 Client                     Central Server
   |                              |
   |--- TCP connect ------------->|
-  |--- HELLO(clientName) ------->|
-  |<-- HELLO_ACK ---------------|
+  |--- LOGIN(user,password,port)>|
+  |<-- LOGIN_ACK ----------------|
   |--- PING -------------------->|
   |<-- PONG ---------------------|
   |--- DISCONNECT ------------->|
   |--- TCP close -------------->|
 ```
 
-Ở các phase sau, cùng control channel sẽ mang `REGISTER`, `LOGIN`, `GET_USERS`,
-`CONNECT_REQUEST` và event trạng thái. Mỗi client có một socket riêng và một
-`ClientHandler` riêng trong thread pool.
+Cùng control channel mang `REGISTER`, `LOGIN`, `GET_USERS`, `CONNECT_REQUEST`,
+`JOIN_GROUP`, `LEAVE_GROUP`, `GROUP_CHAT` và các event trạng thái. Mỗi client có
+một socket riêng và một `ClientHandler` riêng trong thread pool.
 
 ## Luồng P2P dự kiến (Phase 4-6)
 
@@ -75,20 +81,20 @@ khó giới hạn kích thước. Mỗi frame Phase 1 có dạng:
 - `field-count`: số cặp key/value UTF-8; mỗi chuỗi có `length:int` ở trước.
 - Giới hạn: tối đa 64 fields, key 128 bytes, value 64 KiB và frame 256 KiB.
 
-Message Phase 1:
+Các nhóm message chính:
 
 ```text
-HELLO       clientName, clientVersion
-HELLO_ACK   message, remoteAddress
+REGISTER    username, password
+LOGIN       username, password, peerPort
+LOGIN_ACK   message, remoteAddress
 PING        sentAt
 PONG        sentAt, serverTime
+JOIN_GROUP  groupName
+LEAVE_GROUP groupName
+GROUP_CHAT  messageId, groupName, sender, content, timestamp
 DISCONNECT  reason
 ERROR       code, message
 ```
-
-Message dự kiến được thêm theo phase: `REGISTER`, `LOGIN`, `LOGOUT`,
-`GET_USERS`, `USER_LIST`, `CHAT`, `CONNECT_REQUEST`, `PEER_INFO`, `PEER_READY`,
-`FILE_REQUEST`, `FILE_ACCEPT`, `FILE_REJECT`, `FILE_END`, `FILE_CANCEL`.
 File bytes sẽ đi trên P2P data channel bằng một header có độ dài rồi byte stream;
 không nhét binary vào payload UTF-8 của control frame.
 
@@ -121,7 +127,7 @@ Protocol
 ClientMain   ChatClient   ServerConnection   ChatServer   ClientHandler
     |            |               |               |             |
     |--connect-->|--open socket-->|--- TCP ------>|--submit---->|
-    |            |--HELLO-------->|------------->|------------>|
+    |            |--LOGIN-------->|------------->|------------>|
     |            |                |              |  validate   |
     |            |<--future-------|<-------------|<--ACK-------|
     |<--ready----|                |              |             |

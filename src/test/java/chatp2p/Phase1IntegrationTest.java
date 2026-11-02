@@ -3,6 +3,7 @@ package chatp2p;
 import chatp2p.client.ChatClient;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
+import chatp2p.client.LanServerDiscovery;
 import chatp2p.model.ChatMessage;
 import chatp2p.model.FileInfo;
 import chatp2p.protocol.MessageType;
@@ -14,6 +15,7 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.DatagramSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,10 +29,19 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Dependency-free integration smoke test; run with assertions enabled. */
 public final class Phase1IntegrationTest {
+    private static final String TEST_PASSWORD = "phase1-secret";
+
     private Phase1IntegrationTest() {
     }
 
     public static void main(String[] args) throws Exception {
+        Path accountFile = Files.createTempFile("chatp2p-test-users-", ".dat");
+        Files.deleteIfExists(accountFile);
+        System.setProperty("chatp2p.usersFile", accountFile.toString());
+        try (DatagramSocket availablePort = new DatagramSocket(0)) {
+            System.setProperty(
+                    "chatp2p.discoveryPort", Integer.toString(availablePort.getLocalPort()));
+        }
         ChatServer server = new ChatServer(0);
         ExecutorService serverThread = Executors.newSingleThreadExecutor();
         Future<?> serverResult = serverThread.submit(() -> {
@@ -43,9 +54,29 @@ public final class Phase1IntegrationTest {
 
         try {
             server.awaitStarted(Duration.ofSeconds(5));
+            LanServerDiscovery.ServerEndpoint discovered =
+                    LanServerDiscovery.discover(Duration.ofSeconds(3));
+            check(discovered.port() == server.boundPort(),
+                    "UDP Broadcast discovered the wrong server port");
+            registerIfMissing(server.boundPort(), "phase1-a");
+            registerIfMissing(server.boundPort(), "phase1-b");
+            registerIfMissing(server.boundPort(), "abrupt-client");
+            registerIfMissing(server.boundPort(), "after-abort");
+            expectIOException(
+                    () -> ChatClient.registerAccount(
+                            "127.0.0.1", server.boundPort(), "phase1-a", TEST_PASSWORD),
+                    "duplicate registration was accepted");
+            try (ChatClient invalidLogin = new ChatClient()) {
+                expectIOException(
+                        () -> invalidLogin.connect(
+                                "127.0.0.1", server.boundPort(), "phase1-a", "wrong-password"),
+                        "wrong password was accepted");
+            }
             try (ChatClient first = new ChatClient(); ChatClient second = new ChatClient()) {
-                first.connect("127.0.0.1", server.boundPort(), "phase1-a");
-                second.connect("127.0.0.1", server.boundPort(), "phase1-b");
+                first.connect("127.0.0.1", server.boundPort(), "phase1-a", TEST_PASSWORD);
+                second.connect("127.0.0.1", server.boundPort(), "phase1-b", TEST_PASSWORD);
+                check(first.multicastAvailable() && second.multicastAvailable(),
+                        "UDP Multicast channel was not available on both clients");
                 check(first.state() == ConnectionState.CONNECTED, "first client not connected");
                 check(second.state() == ConnectionState.CONNECTED, "second client not connected");
                 check(!first.ping().isNegative(), "first ping duration is invalid");
@@ -68,21 +99,27 @@ public final class Phase1IntegrationTest {
                 check(chatReceived.await(5, TimeUnit.SECONDS), "P2P chat was not received");
 
                 testFileTransfer(first, second);
+                testGroupChat(first, second);
 
                 abortClientConnection(server.boundPort());
                 try (ChatClient afterAbort = new ChatClient()) {
-                    afterAbort.connect("127.0.0.1", server.boundPort(), "after-abort");
+                    afterAbort.connect(
+                            "127.0.0.1", server.boundPort(), "after-abort", TEST_PASSWORD);
                     check(afterAbort.state() == ConnectionState.CONNECTED,
                             "server stopped accepting clients after an abrupt disconnect");
                     check(!afterAbort.ping().isNegative(), "post-abort ping duration is invalid");
                 }
             }
-            System.out.println("PASS: discovery, P2P chat, P2P file checksum, abrupt disconnect and shutdown");
+            System.out.println("PASS: auth, UDP Broadcast discovery, P2P chat/file, "
+                    + "UDP Multicast group send with server fallback, and shutdown");
         } finally {
             server.close();
             serverThread.shutdown();
             serverThread.awaitTermination(5, TimeUnit.SECONDS);
             serverResult.get(5, TimeUnit.SECONDS);
+            Files.deleteIfExists(accountFile);
+            System.clearProperty("chatp2p.usersFile");
+            System.clearProperty("chatp2p.discoveryPort");
         }
     }
 
@@ -99,19 +136,63 @@ public final class Phase1IntegrationTest {
                     new BufferedOutputStream(socket.getOutputStream()));
             DataInputStream input = new DataInputStream(
                     new BufferedInputStream(socket.getInputStream()));
-            ProtocolMessage hello = ProtocolMessage.builder(MessageType.HELLO)
-                    .field("clientName", "abrupt-client")
-                    .field("clientVersion", "1.0")
+            ProtocolMessage hello = ProtocolMessage.builder(MessageType.LOGIN)
+                    .field("username", "abrupt-client")
+                    .field("password", TEST_PASSWORD)
                     .field("peerPort", "65000")
                     .build();
             Protocol.writeMessage(output, hello);
             ProtocolMessage response = Protocol.readMessage(input);
-            check(response.type() == MessageType.HELLO_ACK, "abrupt client handshake failed");
+            check(response.type() == MessageType.LOGIN_ACK, "abrupt client login failed");
 
             // SO_LINGER=0 sends a TCP reset, simulating a process/network failure.
             socket.setSoLinger(true, 0);
         } finally {
             socket.close();
+        }
+    }
+
+    private static void registerIfMissing(int port, String username) throws Exception {
+        try {
+            ChatClient.registerAccount("127.0.0.1", port, username, TEST_PASSWORD);
+        } catch (java.io.IOException existing) {
+            if (!existing.getMessage().contains("USERNAME_EXISTS")) {
+                throw existing;
+            }
+        }
+    }
+
+    private static void testGroupChat(ChatClient sender, ChatClient receiver) throws Exception {
+        String group = "phase1-room";
+        sender.joinGroup(group);
+        receiver.joinGroup(group);
+        CountDownLatch delivered = new CountDownLatch(1);
+        receiver.addEventListener(new ClientEventListener() {
+            @Override
+            public void onGroupChatReceived(chatp2p.model.GroupMessage message) {
+                if (message.groupName().equals(group)
+                        && message.sender().equals("phase1-a")
+                        && message.content().equals("hello-group")) {
+                    delivered.countDown();
+                }
+            }
+        });
+        sender.sendGroupChat(group, "hello-group");
+        check(delivered.await(5, TimeUnit.SECONDS), "group chat was not received");
+        receiver.leaveGroup(group);
+        expectIOException(
+                () -> receiver.sendGroupChat(group, "must-fail"),
+                "non-member was allowed to send group chat");
+        sender.leaveGroup(group);
+    }
+
+    private static void expectIOException(CheckedAction action, String failureMessage)
+            throws Exception {
+        try {
+            action.run();
+            throw new AssertionError(failureMessage);
+        } catch (java.io.IOException expected) {
+            // Expected rejection from the server.
         }
     }
 
@@ -173,5 +254,10 @@ public final class Phase1IntegrationTest {
     @FunctionalInterface
     private interface CheckedCondition {
         boolean test() throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface CheckedAction {
+        void run() throws Exception;
     }
 }

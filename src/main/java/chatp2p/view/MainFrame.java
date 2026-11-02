@@ -1,31 +1,42 @@
 package chatp2p.view;
 
+import chatp2p.client.AudioRecorder;
 import chatp2p.client.ChatClient;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
 import chatp2p.client.TransferHandle;
 import chatp2p.model.ChatMessage;
 import chatp2p.model.FileInfo;
+import chatp2p.model.GroupInfo;
+import chatp2p.model.GroupMessage;
 import chatp2p.model.PeerInfo;
 import chatp2p.model.TransferDirection;
 import chatp2p.model.TransferProgress;
 import chatp2p.model.TransferState;
 
-import java.awt.BorderLayout;
 import java.awt.BasicStroke;
+import java.awt.BorderLayout;
+import java.awt.CardLayout;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Cursor;
+import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
-import java.awt.GridBagLayout;
+import java.awt.GridLayout;
+import java.awt.Insets;
+import java.awt.Polygon;
 import java.awt.RenderingHints;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
+import java.awt.image.BufferedImage;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -33,11 +44,18 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.LineEvent;
+import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -46,11 +64,13 @@ import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
+import javax.swing.ImageIcon;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
+import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
@@ -59,31 +79,87 @@ import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.Timer;
+import javax.swing.border.AbstractBorder;
+import javax.swing.filechooser.FileNameExtensionFilter;
 
-/** Main client UI with live user discovery, direct P2P chat and file transfer. */
+/** Modern Zalo/Messenger-inspired client interface with live P2P chat and file transfer. */
 public final class MainFrame extends JFrame {
     private static final DateTimeFormatter MESSAGE_TIME =
             DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault());
 
     private final ChatClient client;
-    private final String host;
-    private final int port;
     private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    // Data models & raw cache for live search filtering
+    private final List<PeerInfo> rawUsers = new ArrayList<>();
+    private final List<GroupInfo> rawGroups = new ArrayList<>();
     private final DefaultListModel<PeerInfo> userModel = new DefaultListModel<>();
     private final JList<PeerInfo> userList = new JList<>(userModel);
-    private final JLabel userCount = new JLabel("0 online");
-    private final JLabel chatTitle = new JLabel("Chọn người dùng để trò chuyện");
-    private final JLabel chatSubtitle = new JLabel("Danh sách online được cập nhật từ Server");
+    private final DefaultListModel<GroupInfo> groupModel = new DefaultListModel<>();
+    private final JList<GroupInfo> groupList = new JList<>(groupModel);
+
+    // Navigation & Search controls
+    private final PlaceholderTextField searchField =
+            new PlaceholderTextField("Tìm kiếm...");
+    private final JButton tabUsersButton = new JButton("Bạn bè");
+    private final JButton tabGroupsButton = new JButton("Nhóm");
+    private final CardLayout listCardLayout = new CardLayout();
+    private final JPanel listContainer = new JPanel(listCardLayout);
+    private final JTextField groupNameField = new JTextField();
+    private final JButton joinGroupButton = new JButton("Tham gia");
+
+    // Chat Header components
+    private final JPanel headerAvatarPanel = new JPanel() {
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                if (selectedGroup != null) {
+                    UiTheme.drawAvatar(g2, selectedGroup.name(), 0, 0, 42, true, false);
+                } else if (selectedPeer != null) {
+                    UiTheme.drawAvatar(g2, selectedPeer.username(), 0, 0, 42, false, true);
+                }
+            } finally {
+                g2.dispose();
+            }
+        }
+    };
+    private final JLabel chatTitle = new JLabel("Chọn một cuộc trò chuyện");
+    private final JLabel chatSubtitle = new JLabel("Kết nối trực tiếp qua P2P TCP");
+    private final JButton leaveGroupButton = new JButton("Rời nhóm");
+
+    // Chat Area components
     private final JPanel messagesPanel = new JPanel();
     private final JScrollPane messagesScroll = new JScrollPane(messagesPanel);
-    private final JTextField messageField = new JTextField();
-    private final JButton fileButton = new JButton("FILE");
-    private final JButton sendButton = new JButton("GỬI");
+    private final PlaceholderTextField messageField = new PlaceholderTextField("Nhập tin nhắn... (Enter để gửi)");
+    private final ComposerIconButton emojiButton =
+            new ComposerIconButton(ComposerIcon.SMILE, "Biểu cảm");
+    private final ComposerIconButton fileButton =
+            new ComposerIconButton(ComposerIcon.ATTACH, "Gửi file P2P");
+    private final ComposerIconButton audioButton =
+            new ComposerIconButton(ComposerIcon.MICROPHONE, "Thu và gửi âm thanh");
+    private final ComposerIconButton videoButton =
+            new ComposerIconButton(ComposerIcon.VIDEO, "Gửi video P2P");
+    private final ComposerIconButton sendButton =
+            new ComposerIconButton(ComposerIcon.SEND, "Gửi tin nhắn");
+
+    // History tracking
     private final Map<String, List<ConversationEntry>> histories = new HashMap<>();
+    private final Map<String, List<GroupMessage>> groupHistories = new HashMap<>();
     private final Map<UUID, FileEntry> fileEntries = new HashMap<>();
     private final Map<UUID, TransferHandle> outgoingTransfers = new HashMap<>();
+    private final Map<UUID, Path> outgoingSourcePaths = new HashMap<>();
+    private final Map<UUID, Clip> playingAudio = new HashMap<>();
+    private final Map<Path, ImageIcon> imageThumbnails = new HashMap<>();
+    private final Set<Path> loadingThumbnails = new HashSet<>();
+    private final Set<Path> failedThumbnails = new HashSet<>();
+    private final AudioRecorder audioRecorder = new AudioRecorder();
+
     private final Timer connectionTimer;
     private volatile PeerInfo selectedPeer;
+    private volatile GroupInfo selectedGroup;
+    private volatile PeerInfo audioRecordingPeer;
 
     private final ClientEventListener eventListener = new ClientEventListener() {
         @Override
@@ -97,6 +173,16 @@ public final class MainFrame extends JFrame {
         }
 
         @Override
+        public void onGroupsChanged(List<GroupInfo> groups) {
+            SwingUtilities.invokeLater(() -> updateGroups(groups));
+        }
+
+        @Override
+        public void onGroupChatReceived(GroupMessage message) {
+            SwingUtilities.invokeLater(() -> addGroupMessage(message));
+        }
+
+        @Override
         public boolean onFileOffered(FileInfo file) {
             TransferProgress offered = new TransferProgress(
                     file,
@@ -105,7 +191,7 @@ public final class MainFrame extends JFrame {
                     0,
                     0,
                     -1,
-                    "Preparing to receive");
+                    "Chuẩn bị nhận file...");
             SwingUtilities.invokeLater(() -> updateFileEntry(offered));
             return true;
         }
@@ -131,14 +217,12 @@ public final class MainFrame extends JFrame {
         }
     };
 
-    public MainFrame(ChatClient client, String host, int port) {
+    public MainFrame(ChatClient client) {
         super("Chat P2P - " + client.clientName());
         this.client = client;
-        this.host = host;
-        this.port = port;
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-        setMinimumSize(new Dimension(920, 620));
-        setSize(1100, 720);
+        setMinimumSize(new Dimension(960, 640));
+        setSize(1140, 750);
         setLocationRelativeTo(null);
         setContentPane(createContent());
         configureActions();
@@ -155,97 +239,246 @@ public final class MainFrame extends JFrame {
     }
 
     private JPanel createContent() {
-        JPanel root = UiTheme.panel(new BorderLayout(), UiTheme.BACKGROUND);
-        root.add(createHeader(), BorderLayout.NORTH);
+        JPanel root = UiTheme.panel(new BorderLayout(), UiTheme.CHAT_BG);
+        // 1. Navigation Rail (Leftmost bar ~64px wide, Zalo style)
+        root.add(createRailPanel(), BorderLayout.WEST);
+
+        // 2. Middle & Right: SplitPane between Conversation List and Chat Workspace
         JSplitPane split = new JSplitPane(
-                JSplitPane.HORIZONTAL_SPLIT, createUsersPanel(), createChatWorkspace());
-        split.setDividerLocation(270);
+                JSplitPane.HORIZONTAL_SPLIT, createSidebarPanel(), createChatWorkspace());
+        split.setDividerLocation(310);
         split.setDividerSize(1);
         split.setBorder(null);
         root.add(split, BorderLayout.CENTER);
         return root;
     }
 
-    private JPanel createHeader() {
-        JPanel header = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
-        header.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0, UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(14, 22, 14, 22)));
+    /** Modern Left Rail (dock) containing current user avatar, tab icons, and logout button. */
+    private JPanel createRailPanel() {
+        JPanel rail = UiTheme.panel(new BorderLayout(), UiTheme.RAIL_BG);
+        rail.setPreferredSize(new Dimension(64, 0));
+        rail.setBorder(BorderFactory.createEmptyBorder(16, 8, 16, 8));
 
-        JPanel brand = UiTheme.panel(new FlowLayout(FlowLayout.LEFT, 9, 0), UiTheme.WHITE);
-        brand.add(UiTheme.label("●", new Font("Segoe UI", Font.BOLD, 22), UiTheme.PRIMARY));
-        brand.add(UiTheme.label("Chat P2P", new Font("Segoe UI", Font.BOLD, 20), UiTheme.NAVY));
-        JLabel peerBadge = UiTheme.label(
-                "PEER : " + client.peerPort(), new Font("Segoe UI", Font.BOLD, 10), UiTheme.PRIMARY_DARK);
-        peerBadge.setOpaque(true);
-        peerBadge.setBackground(new Color(219, 234, 254));
-        peerBadge.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
-        brand.add(peerBadge);
+        // Top: Current user avatar
+        JPanel topPanel = UiTheme.panel(new FlowLayout(FlowLayout.CENTER, 0, 0), UiTheme.RAIL_BG);
+        JPanel userAvatar = new JPanel() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g.create();
+                try {
+                    UiTheme.drawAvatar(g2, client.clientName(), 0, 0, 44, false, false);
+                } finally {
+                    g2.dispose();
+                }
+            }
+        };
+        userAvatar.setPreferredSize(new Dimension(44, 44));
+        userAvatar.setOpaque(false);
+        userAvatar.setToolTipText("Tài khoản: " + client.clientName() + " (Peer Port: " + client.peerPort() + ")");
+        topPanel.add(userAvatar);
 
-        JPanel account = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 8, 1), UiTheme.WHITE);
-        account.add(UiTheme.label(client.clientName(), UiTheme.BODY_BOLD, UiTheme.NAVY));
-        JLabel onlineBadge = UiTheme.label(
-                "●  ONLINE", new Font("Segoe UI", Font.BOLD, 12), UiTheme.SUCCESS);
-        onlineBadge.setOpaque(true);
-        onlineBadge.setBackground(new Color(240, 253, 244));
-        onlineBadge.setBorder(BorderFactory.createEmptyBorder(7, 10, 7, 10));
-        account.add(onlineBadge);
-        JButton disconnect = new JButton("Đăng xuất");
-        UiTheme.stylePrimaryButton(disconnect);
-        disconnect.setBackground(UiTheme.DANGER);
-        disconnect.setForeground(UiTheme.WHITE);
-        disconnect.setPreferredSize(new Dimension(112, 42));
-        disconnect.addActionListener(event -> disconnectAndReturn());
-        account.add(disconnect);
-        header.add(brand, BorderLayout.WEST);
-        header.add(account, BorderLayout.EAST);
-        return header;
+        // Center: Navigation Icons (Chat, Groups)
+        JPanel navPanel = UiTheme.panel(null, UiTheme.RAIL_BG);
+        navPanel.setLayout(new BoxLayout(navPanel, BoxLayout.Y_AXIS));
+        UiTheme.addVerticalGap(navPanel, 20);
+
+        RailIconButton chatIcon = new RailIconButton(
+                RailIcon.CHAT, Color.WHITE, "Tin nhắn", true);
+        RailIconButton groupIcon = new RailIconButton(
+                RailIcon.GROUP, new Color(165, 243, 252), "Nhóm chat", false);
+
+        chatIcon.addActionListener(e -> {
+            chatIcon.setSelected(true);
+            groupIcon.setSelected(false);
+            switchTab("USERS");
+        });
+        groupIcon.addActionListener(e -> {
+            groupIcon.setSelected(true);
+            chatIcon.setSelected(false);
+            switchTab("GROUPS");
+        });
+
+        navPanel.add(chatIcon);
+        UiTheme.addVerticalGap(navPanel, 12);
+        navPanel.add(groupIcon);
+
+        // Bottom: Status & Logout
+        JPanel bottomPanel = UiTheme.panel(null, UiTheme.RAIL_BG);
+        bottomPanel.setLayout(new BoxLayout(bottomPanel, BoxLayout.Y_AXIS));
+
+        RailIconButton logoutBtn = new RailIconButton(
+                RailIcon.LOGOUT, new Color(254, 202, 202), "Đăng xuất", false);
+        logoutBtn.addActionListener(e -> disconnectAndReturn());
+        bottomPanel.add(logoutBtn);
+
+        rail.add(topPanel, BorderLayout.NORTH);
+        rail.add(navPanel, BorderLayout.CENTER);
+        rail.add(bottomPanel, BorderLayout.SOUTH);
+        return rail;
     }
 
-    private JPanel createUsersPanel() {
-        JPanel panel = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
-        panel.setBorder(BorderFactory.createMatteBorder(0, 0, 0, 1, UiTheme.BORDER));
+    /** Sidebar with real-time search bar, pill switchers, and user/group lists. */
+    private JPanel createSidebarPanel() {
+        JPanel sidebar = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
+        sidebar.setBorder(BorderFactory.createMatteBorder(0, 0, 0, 1, UiTheme.BORDER));
 
-        JPanel heading = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
-        heading.setBorder(BorderFactory.createEmptyBorder(18, 18, 12, 18));
-        heading.add(UiTheme.label("NGƯỜI DÙNG ONLINE",
-                new Font("Segoe UI", Font.BOLD, 12), UiTheme.SLATE), BorderLayout.WEST);
-        userCount.setFont(new Font("Segoe UI", Font.BOLD, 11));
-        userCount.setForeground(UiTheme.SUCCESS);
-        heading.add(userCount, BorderLayout.EAST);
+        // Top Search & Tabs
+        JPanel topArea = UiTheme.panel(null, UiTheme.WHITE);
+        topArea.setLayout(new BoxLayout(topArea, BoxLayout.Y_AXIS));
+        topArea.setBorder(BorderFactory.createEmptyBorder(14, 14, 10, 14));
 
+        JLabel titleLabel = UiTheme.label("Đoạn chat", new Font("Segoe UI", Font.BOLD, 20), UiTheme.NAVY);
+        titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        topArea.add(titleLabel);
+        UiTheme.addVerticalGap(topArea, 12);
+
+        // Search Box (Pill-shaped)
+        searchField.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        searchField.setForeground(UiTheme.NAVY);
+        searchField.setBackground(new Color(241, 243, 246));
+        searchField.setCaretColor(UiTheme.PRIMARY);
+        searchField.setBorder(BorderFactory.createCompoundBorder(
+                new RoundedBorder(new Color(226, 230, 238), 16),
+                BorderFactory.createEmptyBorder(7, 12, 7, 12)));
+        searchField.setAlignmentX(Component.LEFT_ALIGNMENT);
+        searchField.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        searchField.setPreferredSize(new Dimension(280, 36));
+        searchField.setToolTipText("Tìm kiếm bạn bè hoặc nhóm...");
+        searchField.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyReleased(KeyEvent e) {
+                filterLists();
+            }
+        });
+        topArea.add(searchField);
+        UiTheme.addVerticalGap(topArea, 12);
+
+        // Pill Switcher Tabs: [Bạn bè] [Nhóm]
+        JPanel pillPanel = UiTheme.panel(new GridLayout(1, 2, 6, 0), UiTheme.WHITE);
+        pillPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        pillPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        pillPanel.setPreferredSize(new Dimension(280, 32));
+
+        stylePillButton(tabUsersButton, true);
+        stylePillButton(tabGroupsButton, false);
+
+        tabUsersButton.addActionListener(e -> switchTab("USERS"));
+        tabGroupsButton.addActionListener(e -> switchTab("GROUPS"));
+
+        pillPanel.add(tabUsersButton);
+        pillPanel.add(tabGroupsButton);
+        topArea.add(pillPanel);
+
+        // Lists Container
         userList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        userList.setFixedCellHeight(64);
+        userList.setFixedCellHeight(68);
         userList.setBackground(UiTheme.WHITE);
-        userList.setSelectionBackground(new Color(239, 246, 255));
         userList.setCellRenderer(new UserRenderer());
-        JScrollPane scroll = new JScrollPane(userList);
-        scroll.setBorder(null);
-        panel.add(heading, BorderLayout.NORTH);
-        panel.add(scroll, BorderLayout.CENTER);
+        JScrollPane userScroll = new JScrollPane(userList);
+        UiTheme.applyModernScrollBar(userScroll);
 
-        JLabel server = UiTheme.label(
-                "Server: " + host + ":" + port,
-                new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED);
-        server.setBorder(BorderFactory.createCompoundBorder(
+        JPanel groupsPanel = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
+        groupList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        groupList.setFixedCellHeight(68);
+        groupList.setBackground(UiTheme.WHITE);
+        groupList.setCellRenderer(new GroupRenderer());
+        JScrollPane groupScroll = new JScrollPane(groupList);
+        UiTheme.applyModernScrollBar(groupScroll);
+
+        // Quick join group bar at the bottom of groups list
+        JPanel joinPanel = UiTheme.panel(new BorderLayout(6, 0), new Color(248, 250, 252));
+        joinPanel.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(1, 0, 0, 0, UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(11, 16, 11, 16)));
-        panel.add(server, BorderLayout.SOUTH);
-        return panel;
+                BorderFactory.createEmptyBorder(10, 10, 10, 10)));
+        groupNameField.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        groupNameField.setBackground(UiTheme.WHITE);
+        groupNameField.setBorder(BorderFactory.createCompoundBorder(
+                new RoundedBorder(UiTheme.BORDER, 14),
+                BorderFactory.createEmptyBorder(6, 10, 6, 10)));
+        groupNameField.setToolTipText("Tên nhóm mới hoặc nhóm đã có");
+        joinGroupButton.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        joinGroupButton.setForeground(UiTheme.WHITE);
+        joinGroupButton.setBackground(UiTheme.PRIMARY);
+        joinGroupButton.setFocusPainted(false);
+        joinGroupButton.setBorderPainted(false);
+        joinGroupButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        joinGroupButton.setPreferredSize(new Dimension(84, 34));
+        joinPanel.add(groupNameField, BorderLayout.CENTER);
+        joinPanel.add(joinGroupButton, BorderLayout.EAST);
+
+        groupsPanel.add(groupScroll, BorderLayout.CENTER);
+        groupsPanel.add(joinPanel, BorderLayout.SOUTH);
+
+        listContainer.add(userScroll, "USERS");
+        listContainer.add(groupsPanel, "GROUPS");
+
+        sidebar.add(topArea, BorderLayout.NORTH);
+        sidebar.add(listContainer, BorderLayout.CENTER);
+        return sidebar;
     }
 
+    private void switchTab(String tabName) {
+        listCardLayout.show(listContainer, tabName);
+        boolean isUsers = "USERS".equals(tabName);
+        stylePillButton(tabUsersButton, isUsers);
+        stylePillButton(tabGroupsButton, !isUsers);
+    }
+
+    private void stylePillButton(JButton button, boolean active) {
+        button.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        button.setFocusPainted(false);
+        button.setBorderPainted(false);
+        button.setOpaque(true);
+        button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        if (active) {
+            button.setBackground(new Color(231, 243, 255));
+            button.setForeground(UiTheme.PRIMARY);
+        } else {
+            button.setBackground(new Color(241, 243, 246));
+            button.setForeground(UiTheme.SLATE);
+        }
+    }
+
+    /** Filter both userModel and groupModel based on searchField text. */
+    private void filterLists() {
+        String query = searchField.getText().trim().toLowerCase();
+        String currentSelectedUser = selectedPeer == null ? null : selectedPeer.username();
+        userModel.clear();
+        for (PeerInfo peer : rawUsers) {
+            if (query.isEmpty() || peer.username().toLowerCase().contains(query)) {
+                userModel.addElement(peer);
+                if (peer.username().equals(currentSelectedUser)) {
+                    userList.setSelectedValue(peer, false);
+                }
+            }
+        }
+
+        String currentSelectedGroupName = selectedGroup == null ? null : selectedGroup.name();
+        groupModel.clear();
+        for (GroupInfo group : rawGroups) {
+            if (query.isEmpty() || group.name().toLowerCase().contains(query)) {
+                groupModel.addElement(group);
+                if (group.name().equals(currentSelectedGroupName)) {
+                    groupList.setSelectedValue(group, false);
+                }
+            }
+        }
+    }
+
+    /** Right workspace: Chat header, message bubbles scroll, and pill composer. */
     private JPanel createChatWorkspace() {
-        JPanel workspace = UiTheme.panel(new BorderLayout(), UiTheme.BACKGROUND);
+        JPanel workspace = UiTheme.panel(new BorderLayout(), UiTheme.CHAT_BG);
         workspace.add(createChatHeader(), BorderLayout.NORTH);
 
         messagesPanel.setLayout(new BoxLayout(messagesPanel, BoxLayout.Y_AXIS));
-        messagesPanel.setBackground(UiTheme.BACKGROUND);
-        messagesPanel.setBorder(BorderFactory.createEmptyBorder(16, 18, 16, 18));
-        messagesScroll.setBorder(null);
-        messagesScroll.getVerticalScrollBar().setUnitIncrement(18);
+        messagesPanel.setBackground(UiTheme.CHAT_BG);
+        messagesPanel.setBorder(BorderFactory.createEmptyBorder(18, 22, 18, 22));
+        UiTheme.applyModernScrollBar(messagesScroll);
         workspace.add(messagesScroll, BorderLayout.CENTER);
 
         workspace.add(createComposer(), BorderLayout.SOUTH);
+        renderHistory();
         return workspace;
     }
 
@@ -253,16 +486,39 @@ public final class MainFrame extends JFrame {
         JPanel header = UiTheme.panel(new BorderLayout(), UiTheme.WHITE);
         header.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(0, 0, 1, 0, UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(13, 20, 13, 20)));
-        JPanel labels = UiTheme.panel(null, UiTheme.WHITE);
-        labels.setLayout(new BoxLayout(labels, BoxLayout.Y_AXIS));
-        chatTitle.setFont(new Font("Segoe UI", Font.BOLD, 17));
+                BorderFactory.createEmptyBorder(12, 20, 12, 20)));
+
+        JPanel leftBox = UiTheme.panel(new FlowLayout(FlowLayout.LEFT, 12, 0), UiTheme.WHITE);
+        headerAvatarPanel.setPreferredSize(new Dimension(42, 42));
+        headerAvatarPanel.setOpaque(false);
+
+        JPanel labelBox = UiTheme.panel(null, UiTheme.WHITE);
+        labelBox.setLayout(new BoxLayout(labelBox, BoxLayout.Y_AXIS));
+        chatTitle.setFont(new Font("Segoe UI", Font.BOLD, 16));
         chatTitle.setForeground(UiTheme.NAVY);
         chatSubtitle.setFont(new Font("Segoe UI", Font.PLAIN, 12));
         chatSubtitle.setForeground(UiTheme.MUTED);
-        labels.add(chatTitle);
-        labels.add(chatSubtitle);
-        header.add(labels, BorderLayout.WEST);
+        labelBox.add(chatTitle);
+        labelBox.add(Box.createVerticalStrut(2));
+        labelBox.add(chatSubtitle);
+
+        leftBox.add(headerAvatarPanel);
+        leftBox.add(labelBox);
+
+        JPanel rightBox = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 10, 0), UiTheme.WHITE);
+        leaveGroupButton.setFont(new Font("Segoe UI", Font.BOLD, 12));
+        leaveGroupButton.setForeground(UiTheme.DANGER);
+        leaveGroupButton.setBackground(new Color(254, 242, 242));
+        leaveGroupButton.setBorder(BorderFactory.createCompoundBorder(
+                new RoundedBorder(new Color(254, 202, 202), 14),
+                BorderFactory.createEmptyBorder(6, 14, 6, 14)));
+        leaveGroupButton.setFocusPainted(false);
+        leaveGroupButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        leaveGroupButton.setVisible(false);
+        rightBox.add(leaveGroupButton);
+
+        header.add(leftBox, BorderLayout.WEST);
+        header.add(rightBox, BorderLayout.EAST);
         return header;
     }
 
@@ -270,16 +526,31 @@ public final class MainFrame extends JFrame {
         JPanel composer = UiTheme.panel(new BorderLayout(10, 0), UiTheme.WHITE);
         composer.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(1, 0, 0, 0, UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(13, 16, 13, 16)));
-        messageField.setText("");
-        UiTheme.styleTextField(messageField);
-        JPanel actions = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 8, 0), UiTheme.WHITE);
-        UiTheme.styleSecondaryButton(fileButton);
-        UiTheme.stylePrimaryButton(sendButton);
-        actions.add(fileButton);
-        actions.add(sendButton);
+                BorderFactory.createEmptyBorder(12, 16, 12, 16)));
+
+        // Left action buttons
+        JPanel leftActions = UiTheme.panel(new FlowLayout(FlowLayout.LEFT, 6, 0), UiTheme.WHITE);
+        leftActions.add(fileButton);
+        leftActions.add(audioButton);
+        leftActions.add(videoButton);
+        leftActions.add(emojiButton);
+
+        // Center input field
+        messageField.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        messageField.setForeground(UiTheme.NAVY);
+        messageField.setCaretColor(UiTheme.PRIMARY);
+        messageField.setBackground(new Color(241, 243, 246));
+        messageField.setBorder(BorderFactory.createCompoundBorder(
+                new RoundedBorder(new Color(226, 230, 238), 20),
+                BorderFactory.createEmptyBorder(9, 16, 9, 16)));
+
+        // Right action button
+        JPanel rightActions = UiTheme.panel(new FlowLayout(FlowLayout.RIGHT, 0, 0), UiTheme.WHITE);
+        rightActions.add(sendButton);
+
+        composer.add(leftActions, BorderLayout.WEST);
         composer.add(messageField, BorderLayout.CENTER);
-        composer.add(actions, BorderLayout.EAST);
+        composer.add(rightActions, BorderLayout.EAST);
         setComposerEnabled(false);
         return composer;
     }
@@ -287,67 +558,229 @@ public final class MainFrame extends JFrame {
     private void configureActions() {
         userList.addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting()) {
-                selectPeer(userList.getSelectedValue());
+                PeerInfo selected = userList.getSelectedValue();
+                if (selected != null) {
+                    selectPeer(selected);
+                }
             }
         });
+        groupList.addListSelectionListener(event -> {
+            if (!event.getValueIsAdjusting()) {
+                GroupInfo selected = groupList.getSelectedValue();
+                if (selected != null) {
+                    selectGroup(selected);
+                }
+            }
+        });
+        joinGroupButton.addActionListener(event -> joinGroup());
+        groupNameField.addActionListener(event -> joinGroup());
+        leaveGroupButton.addActionListener(event -> leaveSelectedGroup());
+        emojiButton.addActionListener(event -> showEmojiPicker());
         sendButton.addActionListener(event -> sendMessage());
         messageField.addActionListener(event -> sendMessage());
         fileButton.addActionListener(event -> chooseAndSendFile());
+        audioButton.addActionListener(event -> toggleAudioRecording());
+        videoButton.addActionListener(event -> chooseAndSendVideo());
     }
 
     private void updateUsers(List<PeerInfo> users) {
+        rawUsers.clear();
+        rawUsers.addAll(users);
+        filterLists();
+
         String selectedName = selectedPeer == null ? null : selectedPeer.username();
-        userModel.clear();
         PeerInfo restored = null;
         for (PeerInfo peer : users) {
-            userModel.addElement(peer);
             if (peer.username().equals(selectedName)) {
                 restored = peer;
+                break;
             }
         }
-        userCount.setText(users.size() + " online");
         if (restored != null) {
             userList.setSelectedValue(restored, true);
             selectedPeer = restored;
         } else if (selectedName != null) {
             selectPeer(null);
         }
+        tabUsersButton.setText("Bạn bè (" + users.size() + ")");
     }
 
     private void selectPeer(PeerInfo peer) {
         selectedPeer = peer;
+        selectedGroup = null;
+        groupList.clearSelection();
+        leaveGroupButton.setVisible(false);
+        headerAvatarPanel.repaint();
         if (peer == null) {
-            chatTitle.setText("Chọn người dùng để trò chuyện");
-            chatSubtitle.setText("Danh sách online được cập nhật từ Server");
+            chatTitle.setText("Chọn một cuộc trò chuyện");
+            chatSubtitle.setText("Kết nối trực tiếp qua P2P TCP");
             setComposerEnabled(false);
         } else {
-            chatTitle.setText("Chat với " + peer.username());
-            chatSubtitle.setText("P2P TCP • " + peer.host() + ":" + peer.port());
+            chatTitle.setText(peer.username());
+            chatSubtitle.setText("● Đang hoạt động • P2P: " + peer.host() + ":" + peer.port());
+            chatSubtitle.setForeground(UiTheme.ONLINE_GREEN);
             setComposerEnabled(client.state() == ConnectionState.CONNECTED);
         }
         renderHistory();
     }
 
-    private void sendMessage() {
-        PeerInfo peer = selectedPeer;
-        String text = messageField.getText().trim();
-        if (peer == null || text.isEmpty()) {
+    private void updateGroups(List<GroupInfo> groups) {
+        rawGroups.clear();
+        rawGroups.addAll(groups);
+        filterLists();
+
+        String selectedName = selectedGroup == null ? null : selectedGroup.name();
+        GroupInfo restored = null;
+        for (GroupInfo group : groups) {
+            if (group.joined() && group.name().equals(selectedName)) {
+                restored = group;
+                break;
+            }
+        }
+        if (restored != null) {
+            selectedGroup = restored;
+            groupList.setSelectedValue(restored, true);
+        } else if (selectedName != null) {
+            selectedGroup = null;
+            leaveGroupButton.setVisible(false);
+            renderHistory();
+        }
+        tabGroupsButton.setText("Nhóm (" + groups.size() + ")");
+    }
+
+    private void selectGroup(GroupInfo group) {
+        if (group == null) {
             return;
         }
-        sendButton.setEnabled(false);
-        new SwingWorker<ChatMessage, Void>() {
+        if (!group.joined()) {
+            selectedGroup = null;
+            selectedPeer = null;
+            userList.clearSelection();
+            groupNameField.setText(group.name());
+            chatTitle.setText("Nhóm #" + group.name());
+            chatSubtitle.setForeground(UiTheme.SLATE);
+            chatSubtitle.setText("Chưa tham gia • Nhấn Tham gia để gửi tin");
+            leaveGroupButton.setVisible(false);
+            headerAvatarPanel.repaint();
+            setComposerEnabled(false);
+            renderHistory();
+            return;
+        }
+        selectedGroup = group;
+        selectedPeer = null;
+        userList.clearSelection();
+        chatTitle.setText("Nhóm #" + group.name());
+        chatSubtitle.setForeground(UiTheme.MUTED);
+        chatSubtitle.setText(group.memberCount() + " thành viên • "
+                + (client.multicastAvailable()
+                        ? "UDP Multicast + Server fallback"
+                        : "Server fallback"));
+        leaveGroupButton.setVisible(true);
+        headerAvatarPanel.repaint();
+        setComposerEnabled(client.state() == ConnectionState.CONNECTED);
+        fileButton.setEnabled(false);
+        audioButton.setEnabled(audioRecorder.isRecording());
+        videoButton.setEnabled(false);
+        renderHistory();
+    }
+
+    private void joinGroup() {
+        String groupName = groupNameField.getText().trim();
+        if (groupName.isEmpty()) {
+            chatSubtitle.setForeground(UiTheme.DANGER);
+            chatSubtitle.setText("Hãy nhập tên nhóm cần tham gia");
+            return;
+        }
+        joinGroupButton.setEnabled(false);
+        new SwingWorker<Void, Void>() {
             @Override
-            protected ChatMessage doInBackground() throws Exception {
-                return client.sendChat(peer.username(), text);
+            protected Void doInBackground() throws Exception {
+                client.joinGroup(groupName);
+                return null;
             }
 
             @Override
             protected void done() {
-                sendButton.setEnabled(selectedPeer != null);
+                joinGroupButton.setEnabled(true);
                 try {
-                    ChatMessage sent = get();
+                    get();
+                    groupNameField.setText("");
+                    client.groups().stream()
+                            .filter(group -> group.name().equalsIgnoreCase(groupName) && group.joined())
+                            .findFirst().ifPresent(MainFrame.this::selectGroup);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    chatSubtitle.setForeground(UiTheme.DANGER);
+                    chatSubtitle.setText(friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
+    }
+
+    private void leaveSelectedGroup() {
+        GroupInfo group = selectedGroup;
+        if (group == null) {
+            return;
+        }
+        leaveGroupButton.setEnabled(false);
+        new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                client.leaveGroup(group.name());
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                leaveGroupButton.setEnabled(true);
+                try {
+                    get();
+                    selectedGroup = null;
+                    groupList.clearSelection();
+                    chatTitle.setText("Chọn một cuộc trò chuyện");
+                    chatSubtitle.setText("Bạn đã rời nhóm #" + group.name());
+                    leaveGroupButton.setVisible(false);
+                    headerAvatarPanel.repaint();
+                    setComposerEnabled(false);
+                    renderHistory();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    chatSubtitle.setForeground(UiTheme.DANGER);
+                    chatSubtitle.setText(friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
+    }
+
+    private void sendMessage() {
+        PeerInfo peer = selectedPeer;
+        GroupInfo group = selectedGroup;
+        String text = messageField.getText().trim();
+        if ((peer == null && group == null) || text.isEmpty()) {
+            return;
+        }
+        sendButton.setEnabled(false);
+        new SwingWorker<Object, Void>() {
+            @Override
+            protected Object doInBackground() throws Exception {
+                return group != null
+                        ? client.sendGroupChat(group.name(), text)
+                        : client.sendChat(peer.username(), text);
+            }
+
+            @Override
+            protected void done() {
+                sendButton.setEnabled(selectedPeer != null || selectedGroup != null);
+                try {
+                    Object sent = get();
                     messageField.setText("");
-                    addMessage(sent);
+                    if (sent instanceof ChatMessage chatMessage) {
+                        addMessage(chatMessage);
+                    } else if (sent instanceof GroupMessage groupMessage) {
+                        addGroupMessage(groupMessage);
+                    }
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 } catch (ExecutionException failure) {
@@ -357,18 +790,145 @@ public final class MainFrame extends JFrame {
         }.execute();
     }
 
+    private void showEmojiPicker() {
+        String[] emojis = {
+                "😀", "😂", "😊", "😍", "🥰", "😎", "🤔", "😢",
+                "😭", "😡", "👍", "👎", "👏", "🙏", "💪", "🎉",
+                "❤️", "💙", "🔥", "✨", "✅", "👋", "🤝", "💯"
+        };
+        JPopupMenu picker = new JPopupMenu();
+        picker.setBorder(BorderFactory.createCompoundBorder(
+                new RoundedBorder(UiTheme.BORDER, 12),
+                BorderFactory.createEmptyBorder(6, 6, 6, 6)));
+        JPanel grid = UiTheme.panel(new GridLayout(4, 6, 4, 4), UiTheme.WHITE);
+        for (String emoji : emojis) {
+            JButton item = new JButton(emoji);
+            item.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 20));
+            item.setPreferredSize(new Dimension(40, 36));
+            item.setFocusPainted(false);
+            item.setBorderPainted(false);
+            item.setBackground(UiTheme.WHITE);
+            item.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            item.addActionListener(event -> {
+                int caret = messageField.getCaretPosition();
+                String current = messageField.getText();
+                messageField.setText(current.substring(0, caret) + emoji + current.substring(caret));
+                messageField.setCaretPosition(caret + emoji.length());
+                messageField.requestFocusInWindow();
+                picker.setVisible(false);
+            });
+            grid.add(item);
+        }
+        picker.add(grid);
+        picker.show(emojiButton, 0, -grid.getPreferredSize().height - 10);
+    }
+
     private void chooseAndSendFile() {
         PeerInfo peer = selectedPeer;
         if (peer == null) {
             return;
         }
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Chọn file gửi cho " + peer.username());
+        chooser.setDialogTitle("Chọn file gửi trực tiếp cho " + peer.username());
         if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
         }
         Path file = chooser.getSelectedFile().toPath();
-        fileButton.setEnabled(false);
+        sendPath(peer, file, fileButton);
+    }
+
+    private void chooseAndSendVideo() {
+        PeerInfo peer = selectedPeer;
+        if (peer == null) {
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Chọn video gửi trực tiếp cho " + peer.username());
+        chooser.setFileFilter(new FileNameExtensionFilter(
+                "Video (*.mp4, *.mov, *.avi, *.mkv, *.webm)",
+                "mp4", "mov", "avi", "mkv", "webm"));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        Path video = chooser.getSelectedFile().toPath();
+        if (mediaKind(video.getFileName().toString()) != MediaKind.VIDEO) {
+            showError("Hãy chọn file video MP4, MOV, AVI, MKV hoặc WEBM.");
+            return;
+        }
+        sendPath(peer, video, videoButton);
+    }
+
+    private void toggleAudioRecording() {
+        if (audioRecorder.isRecording()) {
+            stopAudioRecording();
+            return;
+        }
+        PeerInfo peer = selectedPeer;
+        if (peer == null) {
+            return;
+        }
+        audioButton.setEnabled(false);
+        new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                audioRecorder.start();
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    get();
+                    audioRecordingPeer = peer;
+                    audioButton.setActive(true);
+                    audioButton.setToolTipText("Dừng thu và gửi âm thanh");
+                    audioButton.setEnabled(true);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    audioButton.setEnabled(selectedPeer != null);
+                } catch (ExecutionException failure) {
+                    audioButton.setEnabled(selectedPeer != null);
+                    showError(friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
+    }
+
+    private void stopAudioRecording() {
+        PeerInfo peer = audioRecordingPeer;
+        audioButton.setEnabled(false);
+        new SwingWorker<Path, Void>() {
+            @Override
+            protected Path doInBackground() throws Exception {
+                return audioRecorder.stop();
+            }
+
+            @Override
+            protected void done() {
+                audioButton.setActive(false);
+                audioButton.setToolTipText("Thu và gửi âm thanh");
+                audioRecordingPeer = null;
+                try {
+                    Path audio = get();
+                    if (peer == null) {
+                        throw new IOException("Không còn người nhận âm thanh");
+                    }
+                    sendPath(peer, audio, audioButton);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    audioButton.setEnabled(selectedPeer != null);
+                } catch (ExecutionException | IOException failure) {
+                    audioButton.setEnabled(selectedPeer != null);
+                    Throwable cause = failure instanceof ExecutionException
+                            ? failure.getCause() : failure;
+                    showError(friendlyMessage(cause));
+                }
+            }
+        }.execute();
+    }
+
+    private void sendPath(PeerInfo peer, Path file, JButton sourceButton) {
+        sourceButton.setEnabled(false);
         new SwingWorker<TransferHandle, Void>() {
             @Override
             protected TransferHandle doInBackground() throws Exception {
@@ -377,10 +937,15 @@ public final class MainFrame extends JFrame {
 
             @Override
             protected void done() {
-                fileButton.setEnabled(selectedPeer != null);
+                sourceButton.setEnabled(
+                        selectedPeer != null && client.state() == ConnectionState.CONNECTED);
                 try {
                     TransferHandle handle = get();
+                    outgoingSourcePaths.put(handle.fileId(), file);
                     FileEntry entry = fileEntries.get(handle.fileId());
+                    if (entry != null) {
+                        entry.sourcePath = file;
+                    }
                     if (entry == null || entry.isActive()) {
                         outgoingTransfers.put(handle.fileId(), handle);
                     }
@@ -401,7 +966,19 @@ public final class MainFrame extends JFrame {
                 .add(new TextEntry(message));
         if (selectedPeer != null && selectedPeer.username().equals(peerName)) {
             messagesPanel.add(createMessageBubble(message));
-            messagesPanel.add(Box.createVerticalStrut(8));
+            messagesPanel.add(Box.createVerticalStrut(10));
+            messagesPanel.revalidate();
+            messagesPanel.repaint();
+            scrollToBottom();
+        }
+    }
+
+    private void addGroupMessage(GroupMessage message) {
+        groupHistories.computeIfAbsent(message.groupName(), ignored -> new ArrayList<>())
+                .add(message);
+        if (selectedGroup != null && selectedGroup.name().equals(message.groupName())) {
+            messagesPanel.add(createGroupMessageBubble(message));
+            messagesPanel.add(Box.createVerticalStrut(10));
             messagesPanel.revalidate();
             messagesPanel.repaint();
             scrollToBottom();
@@ -411,13 +988,41 @@ public final class MainFrame extends JFrame {
     private void renderHistory() {
         messagesPanel.removeAll();
         PeerInfo peer = selectedPeer;
-        if (peer == null) {
-            JLabel empty = UiTheme.label(
-                    "Chọn một người dùng online ở bên trái để bắt đầu chat.",
-                    UiTheme.SUBTITLE, UiTheme.MUTED);
-            empty.setAlignmentX(Component.CENTER_ALIGNMENT);
+        GroupInfo group = selectedGroup;
+
+        if (group != null) {
+            for (GroupMessage message : groupHistories.getOrDefault(group.name(), List.of())) {
+                messagesPanel.add(createGroupMessageBubble(message));
+                messagesPanel.add(Box.createVerticalStrut(10));
+            }
             messagesPanel.add(Box.createVerticalGlue());
-            messagesPanel.add(empty);
+        } else if (peer == null) {
+            // Empty State view (Messenger style)
+            JPanel emptyBox = UiTheme.panel(null, UiTheme.CHAT_BG);
+            emptyBox.setLayout(new BoxLayout(emptyBox, BoxLayout.Y_AXIS));
+            emptyBox.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            JPanel emptyIcon = new EmptyChatIcon();
+            emptyIcon.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            JLabel emptyTitle = UiTheme.label(
+                    "Chào mừng đến với Chat P2P",
+                    new Font("Segoe UI", Font.BOLD, 18), UiTheme.NAVY);
+            emptyTitle.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            JLabel emptySub = UiTheme.label(
+                    "Chọn một người dùng hoặc nhóm từ danh sách bên trái để bắt đầu trò chuyện.",
+                    UiTheme.SUBTITLE, UiTheme.MUTED);
+            emptySub.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+            emptyBox.add(emptyIcon);
+            emptyBox.add(Box.createVerticalStrut(14));
+            emptyBox.add(emptyTitle);
+            emptyBox.add(Box.createVerticalStrut(6));
+            emptyBox.add(emptySub);
+
+            messagesPanel.add(Box.createVerticalGlue());
+            messagesPanel.add(emptyBox);
             messagesPanel.add(Box.createVerticalGlue());
         } else {
             for (ConversationEntry entry : histories.getOrDefault(peer.username(), List.of())) {
@@ -426,7 +1031,7 @@ public final class MainFrame extends JFrame {
                 } else if (entry instanceof FileEntry fileEntry) {
                     messagesPanel.add(createFileBubble(fileEntry));
                 }
-                messagesPanel.add(Box.createVerticalStrut(8));
+                messagesPanel.add(Box.createVerticalStrut(10));
             }
             messagesPanel.add(Box.createVerticalGlue());
         }
@@ -435,35 +1040,108 @@ public final class MainFrame extends JFrame {
         scrollToBottom();
     }
 
-    private JPanel createMessageBubble(ChatMessage message) {
+    private JPanel createGroupMessageBubble(GroupMessage message) {
         boolean mine = message.sender().equals(client.clientName());
-        JPanel row = UiTheme.panel(
-                new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0),
-                UiTheme.BACKGROUND);
-        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 110));
-        JPanel bubble = UiTheme.panel(null, mine ? UiTheme.PRIMARY : UiTheme.WHITE);
+        JPanel row = UiTheme.panel(new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0), UiTheme.CHAT_BG);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 130));
+
+        if (!mine) {
+            // Left circular avatar for peer
+            JPanel miniAvatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, message.sender(), 0, 0, 30, false, false);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            miniAvatar.setPreferredSize(new Dimension(30, 30));
+            miniAvatar.setOpaque(false);
+            row.add(miniAvatar);
+            row.add(Box.createHorizontalStrut(8));
+        }
+
+        JPanel bubble = new RoundedPanel(mine ? UiTheme.PRIMARY : UiTheme.WHITE, 18);
         bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
-        bubble.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(mine ? UiTheme.PRIMARY : UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(8, 11, 8, 11)));
-        JLabel sender = UiTheme.label(
-                mine ? "Bạn" : message.sender(),
-                new Font("Segoe UI", Font.BOLD, 11),
-                mine ? new Color(219, 234, 254) : UiTheme.SLATE);
+        bubble.setBorder(BorderFactory.createEmptyBorder(9, 14, 9, 14));
+
+        if (!mine) {
+            JLabel sender = UiTheme.label(
+                    message.sender(),
+                    new Font("Segoe UI", Font.BOLD, 11),
+                    UiTheme.getAvatarColor(message.sender()));
+            bubble.add(sender);
+            bubble.add(Box.createVerticalStrut(2));
+        }
+
         JLabel content = UiTheme.label(
-                "<html><div style='width:320px'>" + escapeHtml(message.content()) + "</div></html>",
+                "<html><div style='width:310px; word-wrap: break-word;'>"
+                        + escapeHtml(message.content()) + "</div></html>",
                 UiTheme.BODY, mine ? UiTheme.WHITE : UiTheme.NAVY);
         JLabel time = UiTheme.label(
                 MESSAGE_TIME.format(message.timestamp()),
                 new Font("Segoe UI", Font.PLAIN, 10),
                 mine ? new Color(219, 234, 254) : UiTheme.MUTED);
+
         if (mine) {
-            sender.setAlignmentX(Component.RIGHT_ALIGNMENT);
             content.setAlignmentX(Component.RIGHT_ALIGNMENT);
             time.setAlignmentX(Component.RIGHT_ALIGNMENT);
         }
-        bubble.add(sender);
+
+        bubble.add(content);
         bubble.add(Box.createVerticalStrut(3));
+        bubble.add(time);
+        row.add(bubble);
+        return row;
+    }
+
+    private JPanel createMessageBubble(ChatMessage message) {
+        boolean mine = message.sender().equals(client.clientName());
+        JPanel row = UiTheme.panel(new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0), UiTheme.CHAT_BG);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
+
+        if (!mine) {
+            // Left circular avatar for peer
+            JPanel miniAvatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, message.sender(), 0, 0, 30, false, false);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            miniAvatar.setPreferredSize(new Dimension(30, 30));
+            miniAvatar.setOpaque(false);
+            row.add(miniAvatar);
+            row.add(Box.createHorizontalStrut(8));
+        }
+
+        JPanel bubble = new RoundedPanel(mine ? UiTheme.PRIMARY : UiTheme.WHITE, 18);
+        bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
+        bubble.setBorder(BorderFactory.createEmptyBorder(9, 14, 9, 14));
+
+        JLabel content = UiTheme.label(
+                "<html><div style='width:310px; word-wrap: break-word;'>"
+                        + escapeHtml(message.content()) + "</div></html>",
+                UiTheme.BODY, mine ? UiTheme.WHITE : UiTheme.NAVY);
+        JLabel time = UiTheme.label(
+                MESSAGE_TIME.format(message.timestamp()),
+                new Font("Segoe UI", Font.PLAIN, 10),
+                mine ? new Color(219, 234, 254) : UiTheme.MUTED);
+
+        if (mine) {
+            content.setAlignmentX(Component.RIGHT_ALIGNMENT);
+            time.setAlignmentX(Component.RIGHT_ALIGNMENT);
+        }
+
         bubble.add(content);
         bubble.add(Box.createVerticalStrut(3));
         bubble.add(time);
@@ -473,59 +1151,104 @@ public final class MainFrame extends JFrame {
 
     private JPanel createFileBubble(FileEntry entry) {
         boolean mine = entry.direction == TransferDirection.SENDING;
-        Color bubbleColor = mine ? new Color(219, 234, 254) : UiTheme.WHITE;
-        JPanel row = UiTheme.panel(
-                new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0),
-                UiTheme.BACKGROUND);
-        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 190));
+        MediaKind kind = mediaKind(entry.file.fileName());
+        Path playable = playablePath(entry);
+        boolean visualPreview = (kind == MediaKind.IMAGE || kind == MediaKind.VIDEO)
+                && playable != null && Files.isRegularFile(playable);
+        Color bubbleColor = mine ? new Color(239, 246, 255) : UiTheme.WHITE;
+        JPanel row = UiTheme.panel(new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0), UiTheme.CHAT_BG);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, visualPreview ? 430 : 200));
 
-        JPanel bubble = UiTheme.panel(null, bubbleColor);
+        if (!mine) {
+            JPanel miniAvatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, entry.file.sender(), 0, 0, 30, false, false);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            miniAvatar.setPreferredSize(new Dimension(30, 30));
+            miniAvatar.setOpaque(false);
+            row.add(miniAvatar);
+            row.add(Box.createHorizontalStrut(8));
+        }
+
+        JPanel bubble = new RoundedPanel(bubbleColor, 18);
         bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
-        bubble.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(mine ? new Color(147, 197, 253) : UiTheme.BORDER),
-                BorderFactory.createEmptyBorder(10, 12, 9, 12)));
-        bubble.setPreferredSize(new Dimension(420, 150));
+        bubble.setBorder(BorderFactory.createEmptyBorder(12, 14, 12, 14));
+        bubble.setPreferredSize(new Dimension(440, visualPreview ? 390 : 158));
 
         JLabel owner = UiTheme.label(
-                mine ? "Bạn đã gửi một file" : entry.file.sender() + " đã gửi một file",
+                transferOwnerText(mine, entry.file.sender(), kind),
                 new Font("Segoe UI", Font.BOLD, 11), UiTheme.SLATE);
+
+        // File/media card row with a vector icon.
+        JPanel cardHeader = UiTheme.panel(new BorderLayout(10, 0), bubbleColor);
+        JPanel fileIcon = new MediaFileIcon(kind);
+
+        JPanel nameAndSize = UiTheme.panel(null, bubbleColor);
+        nameAndSize.setLayout(new BoxLayout(nameAndSize, BoxLayout.Y_AXIS));
         JLabel name = UiTheme.label(
-                "FILE  •  " + entry.file.fileName(),
-                new Font("Segoe UI", Font.BOLD, 14), UiTheme.NAVY);
+                entry.file.fileName(), new Font("Segoe UI", Font.BOLD, 14), UiTheme.NAVY);
         JLabel size = UiTheme.label(
-                formatBytes(entry.file.size()),
-                new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED);
+                formatBytes(entry.file.size()), new Font("Segoe UI", Font.PLAIN, 12), UiTheme.MUTED);
+        nameAndSize.add(name);
+        nameAndSize.add(Box.createVerticalStrut(2));
+        nameAndSize.add(size);
+
+        JPanel cardContent;
+        if (visualPreview) {
+            cardContent = UiTheme.panel(null, bubbleColor);
+            cardContent.setLayout(new BoxLayout(cardContent, BoxLayout.Y_AXIS));
+            JPanel preview = kind == MediaKind.IMAGE
+                    ? createImagePreview(entry, playable)
+                    : createVideoPreview(entry, bubbleColor);
+            preview.setAlignmentX(Component.LEFT_ALIGNMENT);
+            nameAndSize.setAlignmentX(Component.LEFT_ALIGNMENT);
+            cardContent.add(preview);
+            cardContent.add(Box.createVerticalStrut(5));
+            cardContent.add(nameAndSize);
+        } else {
+            cardHeader.add(fileIcon, BorderLayout.WEST);
+            cardHeader.add(nameAndSize, BorderLayout.CENTER);
+            cardContent = cardHeader;
+        }
+
+        // Progress bar
         JProgressBar progressBar = new JProgressBar(0, 100);
         progressBar.setStringPainted(true);
         progressBar.setForeground(entry.failureReason == null ? UiTheme.PRIMARY : UiTheme.DANGER);
-        progressBar.setBackground(UiTheme.WHITE);
-        progressBar.setMaximumSize(new Dimension(320, 18));
-        progressBar.setPreferredSize(new Dimension(320, 18));
+        progressBar.setBackground(new Color(226, 232, 240));
+        progressBar.setBorder(BorderFactory.createEmptyBorder());
+        progressBar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 12));
+        progressBar.setPreferredSize(new Dimension(320, 12));
 
         TransferProgress progress = entry.progress;
         int percent = progress == null ? 0 : progress.percent();
         progressBar.setValue(percent);
         progressBar.setString(percent + "%");
+
         String statusText;
         Color statusColor = UiTheme.SLATE;
         if (entry.downloadError != null) {
-            statusText = "Không thể tải xuống: " + entry.downloadError;
+            statusText = "Lỗi lưu file: " + entry.downloadError;
             statusColor = UiTheme.DANGER;
         } else if (entry.downloadedPath != null) {
-            statusText = "Đã tải xuống: " + entry.downloadedPath.getFileName();
+            statusText = "Đã lưu: " + entry.downloadedPath.getFileName();
             statusColor = UiTheme.SUCCESS;
         } else if (entry.failureReason != null) {
             statusText = "Thất bại: " + entry.failureReason;
             statusColor = UiTheme.DANGER;
             progressBar.setString("Lỗi");
         } else if (progress == null || progress.state() == TransferState.WAITING) {
-            statusText = mine ? "Đang chuẩn bị gửi..." : "Đang chuẩn bị nhận...";
+            statusText = mine ? "Đang chờ đối phương nhận..." : "Đang kết nối nhận file...";
         } else if (progress.state() == TransferState.SUCCESS) {
-            statusText = mine
-                    ? "Đã gửi thành công"
-                    : entry.savedPath == null
-                        ? "Đã nhận thành công"
-                        : "Đã nhận thành công:";
+            statusText = mine ? "Đã gửi thành công qua P2P" : "Đã nhận hoàn tất";
             statusColor = UiTheme.SUCCESS;
             progressBar.setValue(100);
             progressBar.setString("100%");
@@ -534,73 +1257,295 @@ public final class MainFrame extends JFrame {
             statusColor = UiTheme.DANGER;
         } else {
             statusText = formatBytes(progress.transferredBytes()) + " / "
-                    + formatBytes(entry.file.size()) + "  •  "
-                    + formatSpeed(progress.bytesPerSecond()) + "  •  "
+                    + formatBytes(entry.file.size()) + " • "
+                    + formatSpeed(progress.bytesPerSecond()) + " • "
                     + formatRemaining(progress.estimatedSeconds());
         }
-        JLabel status = UiTheme.label(
-                "<html><div style='width:320px'>" + escapeHtml(statusText) + "</div></html>",
-                new Font("Segoe UI", Font.PLAIN, 11), statusColor);
+        JLabel status = UiTheme.label(statusText, new Font("Segoe UI", Font.PLAIN, 11), statusColor);
 
-        JPanel details = UiTheme.panel(null, bubbleColor);
-        details.setLayout(new BoxLayout(details, BoxLayout.Y_AXIS));
-        details.add(name);
-        details.add(size);
-        details.add(Box.createVerticalStrut(8));
-        details.add(progressBar);
-        details.add(Box.createVerticalStrut(5));
-        details.add(status);
+        JPanel actionRow = UiTheme.panel(new BorderLayout(), bubbleColor);
+        JLabel time = UiTheme.label(
+                MESSAGE_TIME.format(entry.createdAt), new Font("Segoe UI", Font.PLAIN, 10), UiTheme.MUTED);
+        actionRow.add(time, BorderLayout.WEST);
 
-        JPanel fileBody = UiTheme.panel(new BorderLayout(10, 0), bubbleColor);
-        fileBody.add(details, BorderLayout.CENTER);
+        JPanel mediaActions = UiTheme.panel(
+                new FlowLayout(FlowLayout.RIGHT, 6, 0), bubbleColor);
+
         boolean canDownload = !mine
                 && entry.savedPath != null
                 && progress != null
                 && progress.state() == TransferState.SUCCESS;
+
         if (canDownload) {
             DownloadIconButton download = new DownloadIconButton();
             download.setEnabled(!entry.downloading);
-            download.setToolTipText(entry.downloading
-                    ? "Đang tải xuống..."
-                    : "Tải xuống " + entry.file.fileName());
+            download.setToolTipText("Lưu file về máy");
             download.addActionListener(event -> downloadReceivedFile(entry));
-            JPanel iconHolder = UiTheme.panel(new GridBagLayout(), bubbleColor);
-            iconHolder.setPreferredSize(new Dimension(48, 72));
-            iconHolder.add(download);
-            fileBody.add(iconHolder, BorderLayout.EAST);
+            mediaActions.add(download);
         }
 
-        JPanel footer = UiTheme.panel(new BorderLayout(), bubbleColor);
-        JLabel time = UiTheme.label(
-                MESSAGE_TIME.format(entry.createdAt),
-                new Font("Segoe UI", Font.PLAIN, 10), UiTheme.MUTED);
-        footer.add(time, BorderLayout.WEST);
+        boolean completed = progress != null && progress.state() == TransferState.SUCCESS;
+        if (completed && playable != null && Files.isRegularFile(playable)) {
+            if (kind == MediaKind.AUDIO) {
+                JButton play = createMediaActionButton(
+                        playingAudio.containsKey(entry.file.fileId()) ? "DỪNG" : "PHÁT");
+                play.setToolTipText("Phát hoặc dừng âm thanh");
+                play.addActionListener(event -> toggleAudioPlayback(entry));
+                mediaActions.add(play);
+            } else if (kind == MediaKind.VIDEO) {
+                JButton openVideo = createMediaActionButton("MỞ VIDEO");
+                openVideo.setToolTipText("Phát video bằng ứng dụng mặc định");
+                openVideo.addActionListener(event -> openVideo(entry));
+                mediaActions.add(openVideo);
+            }
+        }
+
         TransferHandle handle = outgoingTransfers.get(entry.file.fileId());
         if (mine && entry.isActive() && handle != null) {
-            JButton cancel = new JButton("HỦY");
+            JButton cancel = new JButton("Hủy gửi");
             UiTheme.styleSecondaryButton(cancel);
             cancel.setForeground(UiTheme.DANGER);
             cancel.addActionListener(event -> {
                 handle.cancel();
                 cancel.setEnabled(false);
-                cancel.setText("ĐANG HỦY...");
+                cancel.setText("Đang hủy...");
             });
-            footer.add(cancel, BorderLayout.EAST);
+            mediaActions.add(cancel);
+        }
+        if (mediaActions.getComponentCount() > 0) {
+            actionRow.add(mediaActions, BorderLayout.EAST);
         }
 
         bubble.add(owner);
-        bubble.add(Box.createVerticalStrut(5));
-        bubble.add(fileBody);
+        bubble.add(Box.createVerticalStrut(6));
+        bubble.add(cardContent);
+        bubble.add(Box.createVerticalStrut(8));
+        bubble.add(progressBar);
         bubble.add(Box.createVerticalStrut(4));
-        bubble.add(footer);
+        bubble.add(status);
+        bubble.add(Box.createVerticalStrut(6));
+        bubble.add(actionRow);
+
         row.add(bubble);
         return row;
+    }
+
+    private JPanel createImagePreview(FileEntry entry, Path source) {
+        Path key = source.toAbsolutePath().normalize();
+        JPanel preview = UiTheme.panel(new BorderLayout(), new Color(226, 232, 240));
+        preview.setBorder(new RoundedBorder(new Color(203, 213, 225), 14));
+        preview.setPreferredSize(new Dimension(400, 220));
+        preview.setMaximumSize(new Dimension(Integer.MAX_VALUE, 220));
+
+        ImageIcon thumbnail = imageThumbnails.get(key);
+        JLabel content;
+        if (thumbnail != null) {
+            content = new JLabel(thumbnail, SwingConstants.CENTER);
+            content.setToolTipText("Ảnh: " + entry.file.fileName());
+        } else {
+            String text = failedThumbnails.contains(key)
+                    ? "Không thể xem trước ảnh" : "Đang tải ảnh...";
+            content = UiTheme.label(text, UiTheme.BODY, UiTheme.MUTED);
+            content.setHorizontalAlignment(SwingConstants.CENTER);
+            requestImageThumbnail(entry, key);
+        }
+        preview.add(content, BorderLayout.CENTER);
+        return preview;
+    }
+
+    private JPanel createVideoPreview(FileEntry entry, Color bubbleColor) {
+        JPanel preview = UiTheme.panel(new BorderLayout(), bubbleColor);
+        preview.setPreferredSize(new Dimension(400, 220));
+        preview.setMaximumSize(new Dimension(Integer.MAX_VALUE, 220));
+        VideoPreviewButton play = new VideoPreviewButton(entry.file.fileName());
+        play.addActionListener(event -> openVideo(entry));
+        preview.add(play, BorderLayout.CENTER);
+        return preview;
+    }
+
+    private void requestImageThumbnail(FileEntry entry, Path source) {
+        if (imageThumbnails.containsKey(source)
+                || failedThumbnails.contains(source)
+                || !loadingThumbnails.add(source)) {
+            return;
+        }
+        new SwingWorker<ImageIcon, Void>() {
+            @Override
+            protected ImageIcon doInBackground() throws Exception {
+                BufferedImage original = ImageIO.read(source.toFile());
+                if (original == null) {
+                    throw new IOException("Định dạng ảnh không được Java hỗ trợ");
+                }
+                double scale = Math.min(
+                        1.0,
+                        Math.min(390.0 / original.getWidth(), 210.0 / original.getHeight()));
+                int width = Math.max(1, (int) Math.round(original.getWidth() * scale));
+                int height = Math.max(1, (int) Math.round(original.getHeight() * scale));
+                BufferedImage scaled = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+                Graphics2D canvas = scaled.createGraphics();
+                try {
+                    canvas.setRenderingHint(
+                            RenderingHints.KEY_INTERPOLATION,
+                            RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+                    canvas.setRenderingHint(
+                            RenderingHints.KEY_RENDERING,
+                            RenderingHints.VALUE_RENDER_QUALITY);
+                    canvas.drawImage(original, 0, 0, width, height, null);
+                } finally {
+                    canvas.dispose();
+                }
+                return new ImageIcon(scaled);
+            }
+
+            @Override
+            protected void done() {
+                loadingThumbnails.remove(source);
+                try {
+                    imageThumbnails.put(source, get());
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    failedThumbnails.add(source);
+                } catch (ExecutionException failure) {
+                    failedThumbnails.add(source);
+                }
+                renderFileConversation(entry);
+            }
+        }.execute();
+    }
+
+    private void toggleAudioPlayback(FileEntry entry) {
+        UUID fileId = entry.file.fileId();
+        Clip current = playingAudio.remove(fileId);
+        if (current != null) {
+            current.stop();
+            current.close();
+            renderFileConversation(entry);
+            return;
+        }
+        Path audio = playablePath(entry);
+        if (audio == null || !Files.isRegularFile(audio)) {
+            showError("File âm thanh không còn tồn tại.");
+            return;
+        }
+        new SwingWorker<Clip, Void>() {
+            @Override
+            protected Clip doInBackground() throws Exception {
+                try (AudioInputStream input = AudioSystem.getAudioInputStream(audio.toFile())) {
+                    Clip clip = AudioSystem.getClip();
+                    clip.open(input);
+                    return clip;
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    Clip clip = get();
+                    playingAudio.put(fileId, clip);
+                    clip.addLineListener(event -> {
+                        if (event.getType() == LineEvent.Type.STOP
+                                && clip.getFramePosition() >= clip.getFrameLength()) {
+                            SwingUtilities.invokeLater(() -> {
+                                if (playingAudio.remove(fileId, clip)) {
+                                    clip.close();
+                                    renderFileConversation(entry);
+                                }
+                            });
+                        }
+                    });
+                    clip.start();
+                    renderFileConversation(entry);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    showError("Không thể phát âm thanh: "
+                            + friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
+    }
+
+    private void openVideo(FileEntry entry) {
+        Path video = playablePath(entry);
+        if (video == null || !Files.isRegularFile(video)) {
+            showError("File video không còn tồn tại.");
+            return;
+        }
+        new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                if (!Desktop.isDesktopSupported()
+                        || !Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                    throw new IOException("Máy không có ứng dụng phát video mặc định");
+                }
+                Desktop.getDesktop().open(video.toFile());
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    get();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    showError("Không thể mở video: " + friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
+    }
+
+    private JButton createMediaActionButton(String text) {
+        JButton button = new JButton(text);
+        button.setFont(new Font("Segoe UI", Font.BOLD, 10));
+        button.setForeground(UiTheme.PRIMARY);
+        button.setBackground(new Color(219, 234, 254));
+        button.setBorder(BorderFactory.createEmptyBorder(5, 9, 5, 9));
+        button.setFocusPainted(false);
+        button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return button;
+    }
+
+    private static Path playablePath(FileEntry entry) {
+        return entry.direction == TransferDirection.SENDING
+                ? entry.sourcePath : entry.savedPath;
+    }
+
+    private static String transferOwnerText(boolean mine, String sender, MediaKind kind) {
+        String content = switch (kind) {
+            case IMAGE -> "một ảnh";
+            case AUDIO -> "một đoạn âm thanh";
+            case VIDEO -> "một video";
+            case FILE -> "một file";
+        };
+        return mine ? "Bạn đã gửi " + content + " trực tiếp"
+                : sender + " đã gửi " + content;
+    }
+
+    private static MediaKind mediaKind(String fileName) {
+        String lower = fileName.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".png") || lower.endsWith(".jpg")
+                || lower.endsWith(".jpeg") || lower.endsWith(".gif")
+                || lower.endsWith(".bmp")) {
+            return MediaKind.IMAGE;
+        }
+        if (lower.endsWith(".wav") || lower.endsWith(".aiff")
+                || lower.endsWith(".aif") || lower.endsWith(".au")) {
+            return MediaKind.AUDIO;
+        }
+        if (lower.endsWith(".mp4") || lower.endsWith(".mov")
+                || lower.endsWith(".avi") || lower.endsWith(".mkv")
+                || lower.endsWith(".webm")) {
+            return MediaKind.VIDEO;
+        }
+        return MediaKind.FILE;
     }
 
     private void updateFileEntry(TransferProgress progress) {
         FileEntry entry = fileEntries.get(progress.file().fileId());
         if (entry == null) {
             entry = new FileEntry(progress.file(), progress.direction(), Instant.now());
+            entry.sourcePath = outgoingSourcePaths.get(progress.file().fileId());
             fileEntries.put(progress.file().fileId(), entry);
             String peerName = progress.direction() == TransferDirection.SENDING
                     ? progress.file().receiver() : progress.file().sender();
@@ -616,7 +1561,9 @@ public final class MainFrame extends JFrame {
     private void markFileCompleted(FileInfo file, Path savedPath) {
         FileEntry entry = fileEntries.get(file.fileId());
         if (entry != null) {
-            entry.savedPath = savedPath;
+            if (savedPath != null) {
+                entry.savedPath = savedPath;
+            }
             renderFileConversation(entry);
         }
     }
@@ -644,12 +1591,12 @@ public final class MainFrame extends JFrame {
         try {
             size = Files.size(file);
         } catch (IOException ignored) {
-            // The reason shown in the card already explains why the file cannot be sent.
         }
         FileInfo info = new FileInfo(
                 UUID.randomUUID(), file.getFileName().toString(), size,
                 client.clientName(), peer.username());
         FileEntry entry = new FileEntry(info, TransferDirection.SENDING, Instant.now());
+        entry.sourcePath = file;
         entry.failureReason = reason;
         fileEntries.put(info.fileId(), entry);
         histories.computeIfAbsent(peer.username(), ignored -> new ArrayList<>()).add(entry);
@@ -659,13 +1606,13 @@ public final class MainFrame extends JFrame {
     private void downloadReceivedFile(FileEntry entry) {
         Path source = entry.savedPath;
         if (source == null || !Files.isRegularFile(source)) {
-            entry.downloadError = "File nhận không còn tồn tại";
+            entry.downloadError = "File nhận không còn tồn tại trên đĩa";
             renderFileConversation(entry);
             return;
         }
 
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Tải xuống " + entry.file.fileName());
+        chooser.setDialogTitle("Lưu file " + entry.file.fileName());
         chooser.setSelectedFile(Path.of(entry.file.fileName()).toFile());
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
@@ -694,7 +1641,7 @@ public final class MainFrame extends JFrame {
                     entry.downloadedPath = get();
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    entry.downloadError = "Đã dừng tải xuống";
+                    entry.downloadError = "Đã dừng tải file";
                 } catch (ExecutionException failure) {
                     entry.downloadError = friendlyMessage(failure.getCause());
                 }
@@ -718,7 +1665,7 @@ public final class MainFrame extends JFrame {
                 return candidate;
             }
         }
-        throw new IOException("Không tìm được tên file trống trong thư mục đã chọn");
+        throw new IOException("Không tìm được tên file trống trong thư mục");
     }
 
     private void renderFileConversation(FileEntry entry) {
@@ -748,27 +1695,39 @@ public final class MainFrame extends JFrame {
     private void setComposerEnabled(boolean enabled) {
         messageField.setEnabled(enabled);
         sendButton.setEnabled(enabled);
-        fileButton.setEnabled(enabled);
-        messageField.setToolTipText(enabled ? null : "Hãy chọn một người dùng online");
+        emojiButton.setEnabled(enabled);
+        fileButton.setEnabled(enabled && selectedPeer != null);
+        audioButton.setEnabled(audioRecorder.isRecording()
+                || (enabled && selectedPeer != null));
+        videoButton.setEnabled(enabled && selectedPeer != null);
     }
 
     private void disconnectAndReturn() {
-        closeClient();
-        dispose();
-        SwingUtilities.invokeLater(() -> new ConnectionFrame().setVisible(true));
+        int choice = JOptionPane.showConfirmDialog(
+                this, "Bạn có chắc chắn muốn đăng xuất?", "Xác nhận", JOptionPane.YES_NO_OPTION);
+        if (choice == JOptionPane.YES_OPTION) {
+            closeClient();
+            dispose();
+            SwingUtilities.invokeLater(() -> new LoginFrame().setVisible(true));
+        }
     }
 
     private void closeClient() {
         if (closed.compareAndSet(false, true)) {
             client.removeEventListener(eventListener);
             connectionTimer.stop();
+            audioRecorder.close();
+            for (Clip clip : playingAudio.values()) {
+                clip.stop();
+                clip.close();
+            }
+            playingAudio.clear();
             client.close();
         }
     }
 
     private void showError(String message) {
-        JOptionPane.showMessageDialog(
-                this, message, "Lỗi mạng", JOptionPane.ERROR_MESSAGE);
+        JOptionPane.showMessageDialog(this, message, "Thông báo lỗi", JOptionPane.ERROR_MESSAGE);
     }
 
     private void scrollToBottom() {
@@ -778,7 +1737,7 @@ public final class MainFrame extends JFrame {
 
     private static String friendlyMessage(Throwable failure) {
         return failure == null || failure.getMessage() == null
-                ? "Không thể hoàn thành thao tác mạng"
+                ? "Thao tác mạng gặp sự cố"
                 : failure.getMessage();
     }
 
@@ -808,7 +1767,7 @@ public final class MainFrame extends JFrame {
     }
 
     private static String formatRemaining(long seconds) {
-        return seconds < 0 ? "Đang tính..." : "Còn " + seconds + " giây";
+        return seconds < 0 ? "Đang tính..." : "Còn " + seconds + "s";
     }
 
     private sealed interface ConversationEntry permits TextEntry, FileEntry {
@@ -817,11 +1776,92 @@ public final class MainFrame extends JFrame {
     private record TextEntry(ChatMessage message) implements ConversationEntry {
     }
 
+    private enum MediaKind {
+        FILE,
+        IMAGE,
+        AUDIO,
+        VIDEO
+    }
+
+    /** File-card icon with a stable color and shape for documents, audio, and video. */
+    private static final class MediaFileIcon extends JPanel {
+        private final MediaKind kind;
+
+        private MediaFileIcon(MediaKind kind) {
+            this.kind = kind;
+            setOpaque(false);
+            setPreferredSize(new Dimension(42, 42));
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_ANTIALIASING,
+                        RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setStroke(new BasicStroke(
+                        2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                switch (kind) {
+                    case FILE -> {
+                        canvas.setColor(new Color(219, 234, 254));
+                        canvas.fillRoundRect(4, 3, 34, 36, 10, 10);
+                        canvas.setColor(UiTheme.PRIMARY);
+                        canvas.drawRoundRect(12, 8, 19, 25, 3, 3);
+                        canvas.drawLine(16, 16, 27, 16);
+                        canvas.drawLine(16, 21, 27, 21);
+                        canvas.drawLine(16, 26, 24, 26);
+                    }
+                    case IMAGE -> {
+                        canvas.setColor(new Color(220, 252, 231));
+                        canvas.fillRoundRect(3, 3, 36, 36, 11, 11);
+                        canvas.setColor(new Color(22, 163, 74));
+                        canvas.drawRoundRect(10, 10, 22, 22, 5, 5);
+                        canvas.fillOval(23, 14, 4, 4);
+                        Polygon mountains = new Polygon();
+                        mountains.addPoint(12, 29);
+                        mountains.addPoint(18, 21);
+                        mountains.addPoint(22, 26);
+                        mountains.addPoint(26, 22);
+                        mountains.addPoint(31, 29);
+                        canvas.drawPolyline(
+                                mountains.xpoints, mountains.ypoints, mountains.npoints);
+                    }
+                    case AUDIO -> {
+                        canvas.setColor(new Color(237, 233, 254));
+                        canvas.fillOval(3, 3, 36, 36);
+                        canvas.setColor(new Color(124, 58, 237));
+                        canvas.drawRoundRect(centerX - 5, centerY - 12, 10, 18, 8, 8);
+                        canvas.drawArc(centerX - 9, centerY - 6, 18, 16, 180, 180);
+                        canvas.drawLine(centerX, centerY + 10, centerX, centerY + 14);
+                    }
+                    case VIDEO -> {
+                        canvas.setColor(new Color(254, 226, 226));
+                        canvas.fillRoundRect(3, 3, 36, 36, 11, 11);
+                        canvas.setColor(new Color(239, 68, 68));
+                        canvas.drawRoundRect(centerX - 12, centerY - 8, 18, 16, 5, 5);
+                        Polygon lens = new Polygon();
+                        lens.addPoint(centerX + 7, centerY - 5);
+                        lens.addPoint(centerX + 13, centerY - 9);
+                        lens.addPoint(centerX + 13, centerY + 9);
+                        lens.addPoint(centerX + 7, centerY + 5);
+                        canvas.drawPolygon(lens);
+                    }
+                }
+            } finally {
+                canvas.dispose();
+            }
+        }
+    }
+
     private static final class FileEntry implements ConversationEntry {
         private final FileInfo file;
         private final TransferDirection direction;
         private final Instant createdAt;
         private TransferProgress progress;
+        private Path sourcePath;
         private Path savedPath;
         private Path downloadedPath;
         private String failureReason;
@@ -843,9 +1883,158 @@ public final class MainFrame extends JFrame {
         }
     }
 
-    /** Compact circular download control that does not depend on an icon font. */
+    /** Rounded card panel with anti-aliasing. */
+    private static final class RoundedPanel extends JPanel {
+        private final Color fill;
+        private final int arc;
+
+        private RoundedPanel(Color fill, int arc) {
+            this.fill = fill;
+            this.arc = arc;
+            setOpaque(false);
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setColor(fill);
+                canvas.fillRoundRect(0, 0, getWidth(), getHeight(), arc, arc);
+            } finally {
+                canvas.dispose();
+            }
+            super.paintComponent(graphics);
+        }
+    }
+
+    private static final class RoundedBorder extends AbstractBorder {
+        private final Color color;
+        private final int arc;
+
+        private RoundedBorder(Color color, int arc) {
+            this.color = color;
+            this.arc = arc;
+        }
+
+        @Override
+        public void paintBorder(
+                Component component, Graphics graphics,
+                int x, int y, int width, int height) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setColor(color);
+                canvas.drawRoundRect(x, y, width - 1, height - 1, arc, arc);
+            } finally {
+                canvas.dispose();
+            }
+        }
+
+        @Override
+        public Insets getBorderInsets(Component component) {
+            return new Insets(2, 4, 2, 4);
+        }
+    }
+
+    private enum ComposerIcon {
+        ATTACH,
+        SMILE,
+        MICROPHONE,
+        VIDEO,
+        SEND
+    }
+
+    /** Vector composer button that does not depend on emoji fonts. */
+    private static final class ComposerIconButton extends JButton {
+        private final ComposerIcon icon;
+        private boolean active;
+
+        private ComposerIconButton(ComposerIcon icon, String tooltip) {
+            this.icon = icon;
+            setToolTipText(tooltip);
+            setPreferredSize(new Dimension(38, 38));
+            setMinimumSize(new Dimension(38, 38));
+            setMaximumSize(new Dimension(38, 38));
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        }
+
+        private void setActive(boolean active) {
+            this.active = active;
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_ANTIALIASING,
+                        RenderingHints.VALUE_ANTIALIAS_ON);
+                if (icon != ComposerIcon.SEND && getModel().isRollover()) {
+                    canvas.setColor(new Color(231, 243, 255));
+                    canvas.fillOval(2, 2, getWidth() - 4, getHeight() - 4);
+                }
+                canvas.setColor(!isEnabled()
+                        ? UiTheme.MUTED : active ? UiTheme.DANGER : UiTheme.PRIMARY);
+                canvas.setStroke(new BasicStroke(
+                        icon == ComposerIcon.SEND ? 2.8f : 2.1f,
+                        BasicStroke.CAP_ROUND,
+                        BasicStroke.JOIN_ROUND));
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                switch (icon) {
+                    case ATTACH -> {
+                        canvas.rotate(-0.55, centerX, centerY);
+                        canvas.drawRoundRect(centerX - 7, centerY - 12, 14, 24, 10, 10);
+                        canvas.drawRoundRect(centerX - 3, centerY - 8, 6, 16, 6, 6);
+                    }
+                    case SMILE -> {
+                        canvas.drawOval(centerX - 10, centerY - 10, 20, 20);
+                        canvas.fillOval(centerX - 5, centerY - 4, 2, 3);
+                        canvas.fillOval(centerX + 3, centerY - 4, 2, 3);
+                        canvas.drawArc(centerX - 5, centerY - 2, 10, 8, 200, 140);
+                    }
+                    case MICROPHONE -> {
+                        canvas.drawRoundRect(centerX - 5, centerY - 11, 10, 17, 9, 9);
+                        canvas.drawArc(centerX - 9, centerY - 5, 18, 15, 180, 180);
+                        canvas.drawLine(centerX, centerY + 10, centerX, centerY + 14);
+                        canvas.drawLine(centerX - 5, centerY + 14, centerX + 5, centerY + 14);
+                    }
+                    case VIDEO -> {
+                        canvas.drawRoundRect(centerX - 11, centerY - 8, 16, 16, 5, 5);
+                        Polygon lens = new Polygon();
+                        lens.addPoint(centerX + 6, centerY - 5);
+                        lens.addPoint(centerX + 12, centerY - 9);
+                        lens.addPoint(centerX + 12, centerY + 9);
+                        lens.addPoint(centerX + 6, centerY + 5);
+                        canvas.drawPolygon(lens);
+                    }
+                    case SEND -> {
+                        // Solid paper-plane icon matching modern chat applications.
+                        Polygon plane = new Polygon();
+                        plane.addPoint(centerX - 11, centerY - 11);
+                        plane.addPoint(centerX + 12, centerY);
+                        plane.addPoint(centerX - 11, centerY + 11);
+                        plane.addPoint(centerX - 6, centerY + 2);
+                        plane.addPoint(centerX + 3, centerY);
+                        plane.addPoint(centerX - 6, centerY - 2);
+                        canvas.fillPolygon(plane);
+                    }
+                }
+            } finally {
+                canvas.dispose();
+            }
+        }
+    }
+
+    /** Circular download button for incoming completed files. */
     private static final class DownloadIconButton extends JButton {
-        private static final int BUTTON_SIZE = 42;
+        private static final int BUTTON_SIZE = 34;
 
         private DownloadIconButton() {
             setPreferredSize(new Dimension(BUTTON_SIZE, BUTTON_SIZE));
@@ -856,7 +2045,117 @@ public final class MainFrame extends JFrame {
             setFocusPainted(false);
             setOpaque(false);
             setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            getAccessibleContext().setAccessibleName("Tải file xuống");
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setColor(isEnabled() ? UiTheme.PRIMARY : UiTheme.MUTED);
+                canvas.fillOval(1, 1, getWidth() - 2, getHeight() - 2);
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                canvas.setColor(UiTheme.WHITE);
+                canvas.setStroke(new BasicStroke(2.0f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                canvas.drawLine(centerX, centerY - 6, centerX, centerY + 4);
+                canvas.drawLine(centerX - 4, centerY, centerX, centerY + 4);
+                canvas.drawLine(centerX + 4, centerY, centerX, centerY + 4);
+                canvas.drawLine(centerX - 6, centerY + 7, centerX + 6, centerY + 7);
+            } finally {
+                canvas.dispose();
+            }
+        }
+    }
+
+    private enum RailIcon {
+        CHAT,
+        GROUP,
+        LOGOUT
+    }
+
+    /** Left navigation vector icon with an active pill indicator. */
+    private static final class RailIconButton extends JButton {
+        private final RailIcon icon;
+        private final Color iconColor;
+
+        private RailIconButton(
+                RailIcon icon, Color iconColor, String tooltip, boolean selected) {
+            this.icon = icon;
+            this.iconColor = iconColor;
+            setSelected(selected);
+            setToolTipText(tooltip);
+            setPreferredSize(new Dimension(48, 48));
+            setMaximumSize(new Dimension(48, 48));
+            setAlignmentX(Component.CENTER_ALIGNMENT);
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        }
+
+        @Override
+        public void setSelected(boolean selected) {
+            super.setSelected(selected);
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                if (isSelected()) {
+                    g2.setColor(new Color(255, 255, 255, 46));
+                    g2.fillRoundRect(4, 4, getWidth() - 8, getHeight() - 8, 16, 16);
+                } else if (getModel().isRollover()) {
+                    g2.setColor(new Color(255, 255, 255, 40));
+                    g2.fillRoundRect(4, 4, getWidth() - 8, getHeight() - 8, 16, 16);
+                }
+                g2.setColor(isEnabled() ? iconColor : new Color(191, 219, 254));
+                g2.setStroke(new BasicStroke(
+                        2.3f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                switch (icon) {
+                    case CHAT -> {
+                        g2.fillRoundRect(centerX - 12, centerY - 10, 24, 18, 10, 10);
+                        Polygon tail = new Polygon();
+                        tail.addPoint(centerX - 7, centerY + 6);
+                        tail.addPoint(centerX - 9, centerY + 13);
+                        tail.addPoint(centerX, centerY + 7);
+                        g2.fillPolygon(tail);
+                        g2.setColor(UiTheme.RAIL_BG);
+                        g2.fillOval(centerX - 6, centerY - 2, 3, 3);
+                        g2.fillOval(centerX - 1, centerY - 2, 3, 3);
+                        g2.fillOval(centerX + 4, centerY - 2, 3, 3);
+                    }
+                    case GROUP -> {
+                        g2.drawOval(centerX - 10, centerY - 10, 8, 8);
+                        g2.drawOval(centerX + 2, centerY - 10, 8, 8);
+                        g2.drawArc(centerX - 14, centerY - 1, 15, 16, 15, 150);
+                        g2.drawArc(centerX - 1, centerY - 1, 15, 16, 15, 150);
+                    }
+                    case LOGOUT -> {
+                        g2.drawRoundRect(centerX - 10, centerY - 12, 13, 24, 3, 3);
+                        g2.drawLine(centerX - 1, centerY, centerX + 12, centerY);
+                        g2.drawLine(centerX + 7, centerY - 5, centerX + 12, centerY);
+                        g2.drawLine(centerX + 7, centerY + 5, centerX + 12, centerY);
+                    }
+                }
+            } finally {
+                g2.dispose();
+            }
+        }
+    }
+
+    /** Colored empty-state chat icon. */
+    private static final class EmptyChatIcon extends JPanel {
+        private EmptyChatIcon() {
+            setOpaque(false);
+            setPreferredSize(new Dimension(72, 72));
+            setMaximumSize(new Dimension(72, 72));
         }
 
         @Override
@@ -866,66 +2165,181 @@ public final class MainFrame extends JFrame {
                 canvas.setRenderingHint(
                         RenderingHints.KEY_ANTIALIASING,
                         RenderingHints.VALUE_ANTIALIAS_ON);
-                int diameter = Math.min(getWidth(), getHeight()) - 4;
-                int left = (getWidth() - diameter) / 2;
-                int top = (getHeight() - diameter) / 2;
-                Color circle = !isEnabled()
-                        ? UiTheme.MUTED
-                        : getModel().isPressed() ? UiTheme.PRIMARY_DARK : UiTheme.PRIMARY;
-                canvas.setColor(circle);
-                canvas.fillOval(left, top, diameter, diameter);
-
-                int centerX = getWidth() / 2;
-                int centerY = getHeight() / 2;
-                canvas.setColor(UiTheme.WHITE);
-                canvas.setStroke(new BasicStroke(
-                        2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-                canvas.drawLine(centerX, centerY - 9, centerX, centerY + 5);
-                canvas.drawLine(centerX - 6, centerY, centerX, centerY + 6);
-                canvas.drawLine(centerX + 6, centerY, centerX, centerY + 6);
-                canvas.drawLine(centerX - 8, centerY + 10, centerX + 8, centerY + 10);
+                canvas.setColor(new Color(219, 234, 254));
+                canvas.fillOval(2, 2, 68, 68);
+                canvas.setColor(UiTheme.PRIMARY);
+                canvas.fillRoundRect(16, 18, 40, 29, 16, 16);
+                Polygon tail = new Polygon();
+                tail.addPoint(24, 43);
+                tail.addPoint(21, 56);
+                tail.addPoint(35, 47);
+                canvas.fillPolygon(tail);
+                canvas.setColor(Color.WHITE);
+                canvas.fillOval(26, 31, 4, 4);
+                canvas.fillOval(34, 31, 4, 4);
+                canvas.fillOval(42, 31, 4, 4);
             } finally {
                 canvas.dispose();
             }
         }
+    }
+
+    /** Inline video preview with a large play control instead of a generic file card. */
+    private static final class VideoPreviewButton extends JButton {
+        private final String fileName;
+
+        private VideoPreviewButton(String fileName) {
+            this.fileName = fileName;
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setFocusPainted(false);
+            setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            setToolTipText("Mở video " + fileName);
+            getAccessibleContext().setAccessibleName("Phát video " + fileName);
+        }
 
         @Override
-        public boolean contains(int x, int y) {
-            double radius = Math.min(getWidth(), getHeight()) / 2.0;
-            double deltaX = x - getWidth() / 2.0;
-            double deltaY = y - getHeight() / 2.0;
-            return deltaX * deltaX + deltaY * deltaY <= radius * radius;
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_ANTIALIASING,
+                        RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setColor(getModel().isRollover()
+                        ? new Color(30, 64, 175) : new Color(15, 23, 42));
+                canvas.fillRoundRect(0, 0, getWidth(), getHeight(), 16, 16);
+
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2 - 8;
+                canvas.setColor(new Color(255, 255, 255, 220));
+                canvas.fillOval(centerX - 25, centerY - 25, 50, 50);
+                canvas.setColor(UiTheme.PRIMARY);
+                Polygon play = new Polygon();
+                play.addPoint(centerX - 7, centerY - 12);
+                play.addPoint(centerX + 14, centerY);
+                play.addPoint(centerX - 7, centerY + 12);
+                canvas.fillPolygon(play);
+
+                canvas.setFont(new Font("Segoe UI", Font.BOLD, 12));
+                canvas.setColor(Color.WHITE);
+                FontMetrics metrics = canvas.getFontMetrics();
+                String label = fileName.length() > 42
+                        ? fileName.substring(0, 39) + "..." : fileName;
+                int textX = Math.max(12, (getWidth() - metrics.stringWidth(label)) / 2);
+                canvas.drawString(label, textX, getHeight() - 18);
+            } finally {
+                canvas.dispose();
+            }
         }
     }
 
+    /** Textfield with placeholder when empty. */
+    private static final class PlaceholderTextField extends JTextField {
+        private final String placeholder;
+
+        private PlaceholderTextField(String placeholder) {
+            this.placeholder = placeholder;
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            if (getText().isEmpty() && !isFocusOwner()) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                try {
+                    g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                    g2.setColor(UiTheme.MUTED);
+                    g2.setFont(getFont());
+                    Insets insets = getInsets();
+                    FontMetrics fm = g2.getFontMetrics();
+                    g2.drawString(placeholder, insets.left, (getHeight() - fm.getHeight()) / 2 + fm.getAscent());
+                } finally {
+                    g2.dispose();
+                }
+            }
+        }
+    }
+
+    /** Modern group list item renderer with circular avatar. */
+    private static final class GroupRenderer extends DefaultListCellRenderer {
+        @Override
+        public Component getListCellRendererComponent(
+                JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+            GroupInfo group = (GroupInfo) value;
+            JPanel row = UiTheme.panel(new BorderLayout(12, 0),
+                    isSelected ? UiTheme.SELECTION_BG : UiTheme.WHITE);
+            row.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
+
+            JPanel avatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, group.name(), 0, 0, 44, true, false);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            avatar.setPreferredSize(new Dimension(44, 44));
+            avatar.setOpaque(false);
+
+            JPanel text = UiTheme.panel(null, row.getBackground());
+            text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
+            JLabel nameLabel = UiTheme.label(group.name(), UiTheme.BODY_BOLD, UiTheme.NAVY);
+            JLabel memberLabel = UiTheme.label(
+                    group.memberCount() + " thành viên" + (group.joined() ? " • Đã tham gia" : ""),
+                    new Font("Segoe UI", Font.PLAIN, 12),
+                    group.joined() ? UiTheme.SUCCESS : UiTheme.MUTED);
+            text.add(nameLabel);
+            text.add(Box.createVerticalStrut(2));
+            text.add(memberLabel);
+
+            row.add(avatar, BorderLayout.WEST);
+            row.add(text, BorderLayout.CENTER);
+            return row;
+        }
+    }
+
+    /** Modern user list item renderer with circular avatar and green online dot. */
     private static final class UserRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(
-                JList<?> list,
-                Object value,
-                int index,
-                boolean isSelected,
-                boolean cellHasFocus) {
+                JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
             PeerInfo peer = (PeerInfo) value;
-            JPanel row = UiTheme.panel(new BorderLayout(11, 0),
-                    isSelected ? new Color(239, 246, 255) : UiTheme.WHITE);
-            row.setBorder(BorderFactory.createEmptyBorder(10, 15, 10, 15));
-            JLabel avatar = new JLabel(
-                    peer.username().substring(0, 1).toUpperCase(), SwingConstants.CENTER);
-            avatar.setFont(new Font("Segoe UI", Font.BOLD, 15));
-            avatar.setForeground(UiTheme.PRIMARY_DARK);
-            avatar.setOpaque(true);
-            avatar.setBackground(new Color(219, 234, 254));
-            avatar.setPreferredSize(new Dimension(40, 40));
+            JPanel row = UiTheme.panel(new BorderLayout(12, 0),
+                    isSelected ? UiTheme.SELECTION_BG : UiTheme.WHITE);
+            row.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
+
+            JPanel avatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, peer.username(), 0, 0, 44, false, true);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            avatar.setPreferredSize(new Dimension(44, 44));
+            avatar.setOpaque(false);
+
             JPanel text = UiTheme.panel(null, row.getBackground());
             text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
-            text.add(UiTheme.label(peer.username(), UiTheme.BODY_BOLD, UiTheme.NAVY));
-            text.add(UiTheme.label(peer.host() + ":" + peer.port(),
-                    new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED));
+            JLabel nameLabel = UiTheme.label(peer.username(), UiTheme.BODY_BOLD, UiTheme.NAVY);
+            JLabel infoLabel = UiTheme.label(
+                    "P2P sẵn sàng • " + peer.host() + ":" + peer.port(),
+                    new Font("Segoe UI", Font.PLAIN, 12), UiTheme.MUTED);
+            text.add(nameLabel);
+            text.add(Box.createVerticalStrut(2));
+            text.add(infoLabel);
+
             row.add(avatar, BorderLayout.WEST);
             row.add(text, BorderLayout.CENTER);
-            row.add(UiTheme.label("●", new Font("Segoe UI", Font.BOLD, 16), UiTheme.SUCCESS),
-                    BorderLayout.EAST);
             return row;
         }
     }

@@ -3,6 +3,7 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 5000,
     [string]$ClientName = 'client-a',
+    [string]$Password = 'chatp2p123',
     [switch]$Console
 )
 
@@ -15,7 +16,7 @@ $classes = Join-Path $projectRoot 'target\classes'
 Push-Location $projectRoot
 try {
     if ($Console) {
-        & java -cp $classes chatp2p.client.ClientMain $HostName $Port $ClientName
+        & java -cp $classes chatp2p.client.ClientMain $HostName $Port $ClientName $Password
     } else {
         & java -cp $classes chatp2p.client.ClientMain
     }

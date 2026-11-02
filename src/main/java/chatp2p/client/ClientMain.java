@@ -1,6 +1,6 @@
 package chatp2p.client;
 
-import chatp2p.view.ConnectionFrame;
+import chatp2p.view.LoginFrame;
 
 import java.awt.GraphicsEnvironment;
 import java.io.IOException;
@@ -19,8 +19,8 @@ public final class ClientMain {
             launchGraphicalClient();
             return;
         }
-        if (args.length != 3) {
-            System.err.println("Usage: ClientMain [<server-host> <server-port> <client-name>]");
+        if (args.length != 4) {
+            System.err.println("Usage: ClientMain [<server-host> <server-port> <username> <password>]");
             System.exit(2);
             return;
         }
@@ -31,20 +31,20 @@ public final class ClientMain {
     private static void launchGraphicalClient() {
         if (GraphicsEnvironment.isHeadless()) {
             System.err.println("A graphical environment is required. "
-                    + "For console mode, provide: <server-host> <server-port> <client-name>");
+                    + "For console mode, provide: <server-host> <server-port> <username> <password>");
             System.exit(2);
             return;
         }
         SwingUtilities.invokeLater(() -> {
-            ConnectionFrame.installLookAndFeel();
-            new ConnectionFrame().setVisible(true);
+            LoginFrame.installLookAndFeel();
+            new LoginFrame().setVisible(true);
         });
     }
 
     private static void runConsoleClient(String[] args) {
         try (ChatClient client = new ChatClient(); Scanner scanner = new Scanner(System.in)) {
             ConnectionOptions options = readOptions(args);
-            client.connect(options.host(), options.port(), options.clientName());
+            client.connect(options.host(), options.port(), options.clientName(), options.password());
             System.out.println("Connected as " + client.clientName() + ". Commands: ping, status, quit");
 
             while (client.state() == ConnectionState.CONNECTED && scanner.hasNextLine()) {
@@ -69,7 +69,7 @@ public final class ClientMain {
     }
 
     private static ConnectionOptions readOptions(String[] args) {
-        return new ConnectionOptions(args[0], parsePort(args[1]), args[2]);
+        return new ConnectionOptions(args[0], parsePort(args[1]), args[2], args[3]);
     }
 
     private static int parsePort(String value) {
@@ -84,6 +84,6 @@ public final class ClientMain {
         }
     }
 
-    private record ConnectionOptions(String host, int port, String clientName) {
+    private record ConnectionOptions(String host, int port, String clientName, String password) {
     }
 }

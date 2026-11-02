@@ -1,12 +1,22 @@
 # ChatP2P - TCP Control + P2P Chat/File
 
 Ứng dụng chat theo kiến trúc **hybrid Client-Server + P2P**. Central Server quản lý
-kết nối, danh sách online và peer discovery; chat và file được truyền trực tiếp
-giữa hai client qua TCP.
+tài khoản, đăng nhập, danh sách online, nhóm chat và peer discovery; chat riêng và
+file được truyền trực tiếp giữa hai client qua TCP. Chat nhóm được server phân phối
+đến các thành viên online vì một tin nhắn có nhiều người nhận.
 
-Đã có `HELLO/HELLO_ACK`, `PING/PONG`, danh sách online, `CONNECT_REQUEST/PEER_INFO`,
-chat 1-1 P2P, gửi/nhận file, Accept/Reject, tiến trình, Cancel và SHA-256. Đăng ký
-và mật khẩu băm chưa được triển khai; tên client hiện đóng vai trò định danh online.
+Đã có `REGISTER/LOGIN`, `PING/PONG`, danh sách online, `CONNECT_REQUEST/PEER_INFO`,
+chat 1-1 P2P, gửi/nhận file, thu-phát Audio WAV, truyền Video, tiến trình,
+Cancel, SHA-256, `JOIN_GROUP`,
+`LEAVE_GROUP` và `GROUP_CHAT`. Mật khẩu được lưu tại `data/users.dat` bằng
+PBKDF2-HMAC-SHA256 với salt riêng; không lưu mật khẩu thuần.
+
+Ứng dụng còn sử dụng UDP đúng mục đích môn Mạng:
+
+- **UDP Broadcast `5050`:** trang đăng nhập/đăng ký có nút `TÌM SERVER TRONG LAN`.
+- **UDP Multicast `239.255.42.99:5051`:** phát tin nhắn nhóm trong LAN; Central
+  Server vẫn xác thực membership và làm fallback khi Wi-Fi chặn multicast.
+- Client khử trùng tin nhắn theo UUID nên một tin multicast + fallback chỉ hiện một lần.
 
 ## 1. Quyết định kiến trúc
 
@@ -74,14 +84,40 @@ Chạy giao diện Swing client ở terminal khác:
 .\scripts\run-client.ps1
 ```
 
-Nhập Server Host, Server Port và tên client trên cửa sổ kết nối. Mở hai client với
-hai tên khác nhau; chọn người dùng online để chat hoặc gửi file. File nhận được lưu
-tại `data/received_files/` và tự đổi tên nếu tên file đã tồn tại.
+Khi demo qua nhiều máy, chạy PowerShell bằng quyền Administrator trên mỗi máy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\allow-chat-p2p-firewall.ps1
+```
+
+Script mở TCP `5000-5010`, UDP `5050-5051` và cho phép `java.exe` nhận kết nối
+P2P trên cổng động. Chạy script bằng quyền Administrator trên từng máy; không cần
+tắt toàn bộ Firewall.
+
+Ứng dụng có hai trang xác thực riêng:
+
+- `LoginFrame`: nhập Server Host, Server Port, tên đăng nhập và mật khẩu.
+- `RegisterFrame`: tạo tài khoản mới, có trường xác nhận mật khẩu và nút quay lại.
+
+Từ trang đăng nhập, chọn `TẠO TÀI KHOẢN` để mở trang đăng ký; đăng ký thành công
+sẽ tự quay về trang đăng nhập và giữ lại Server/username. Trong màn hình chính:
+
+- Tab `NGƯỜI DÙNG`: chọn người online để chat riêng, gửi file, thu/gửi/phát Audio
+  WAV và gửi Video P2P. Ảnh được tải thumbnail bất đồng bộ và hiển thị trực tiếp
+  trong hội thoại; video có preview Play và mở bằng trình phát mặc định.
+- Tab `NHÓM`: nhập tên nhóm rồi nhấn `JOIN`; chọn nhóm đã tham gia để chat và dùng
+  `RỜI NHÓM` khi muốn thoát. JOIN tự tạo nhóm nếu tên đó chưa tồn tại.
+
+File nhận được lưu tại `data/received_files/` và tự đổi tên nếu tên đã tồn tại.
+Audio được thu bằng Java Sound ở PCM mono 16 kHz. Bản hiện tại truyền video dạng
+file trực tiếp; chưa triển khai cuộc gọi video thời gian thực vì Java SE không cung
+cấp sẵn webcam/codec.
 
 Chế độ console vẫn được giữ để kiểm tra nhanh hoặc chạy trên máy không có GUI:
 
 ```powershell
-.\scripts\run-client.ps1 -Console -HostName localhost -Port 5000 -ClientName client-a
+.\scripts\run-client.ps1 -Console -HostName localhost -Port 5000 `
+    -ClientName client-a -Password chatp2p123
 ```
 
 Build bằng Maven nếu đã cài Maven:

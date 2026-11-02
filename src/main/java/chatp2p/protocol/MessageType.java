@@ -19,7 +19,16 @@ public enum MessageType {
     FILE_ACCEPT(13),
     FILE_REJECT(14),
     FILE_END(15),
-    FILE_CANCEL(16);
+    FILE_CANCEL(16),
+    REGISTER(17),
+    REGISTER_ACK(18),
+    LOGIN(19),
+    LOGIN_ACK(20),
+    GET_GROUPS(21),
+    GROUP_LIST(22),
+    JOIN_GROUP(23),
+    LEAVE_GROUP(24),
+    GROUP_CHAT(25);
 
     private final int wireCode;
 

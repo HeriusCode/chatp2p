@@ -27,11 +27,14 @@ public final class ChatServer implements AutoCloseable {
     private final Logger logger;
     private final ServerEventListener eventListener;
     private final UserManager userManager;
+    private final AccountStore accountStore;
+    private final GroupManager groupManager;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong connectionIds = new AtomicLong();
     private final CountDownLatch started = new CountDownLatch(1);
     private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
     private volatile ServerSocket serverSocket;
+    private volatile LanDiscoveryResponder discoveryResponder;
     private volatile IOException startupFailure;
 
     public ChatServer(int port) throws IOException {
@@ -63,6 +66,12 @@ public final class ChatServer implements AutoCloseable {
         this.logger = Objects.requireNonNull(logger, "logger");
         this.eventListener = Objects.requireNonNull(eventListener, "eventListener");
         this.userManager = new UserManager(logger);
+        try {
+            this.accountStore = new AccountStore();
+        } catch (IOException failure) {
+            throw new IllegalStateException("Cannot load data/users.dat", failure);
+        }
+        this.groupManager = new GroupManager(userManager, logger);
     }
 
     /** Binds the port and runs the accept loop until close() is called. */
@@ -75,6 +84,15 @@ public final class ChatServer implements AutoCloseable {
             serverSocket = listener;
             listener.setReuseAddress(true);
             listener.bind(new java.net.InetSocketAddress(configuredPort));
+            try {
+                LanDiscoveryResponder responder =
+                        new LanDiscoveryResponder(listener.getLocalPort(), logger);
+                responder.start();
+                discoveryResponder = responder;
+            } catch (SocketException discoveryFailure) {
+                logger.warning("UDP broadcast discovery unavailable: "
+                        + discoveryFailure.getMessage());
+            }
             logger.info("Server started on port " + listener.getLocalPort());
             publish(ServerEvent.server(
                     ServerEvent.Type.SERVER_STARTED,
@@ -98,7 +116,8 @@ public final class ChatServer implements AutoCloseable {
                     clientPool.execute(() -> {
                         try {
                             new ClientHandler(
-                                    connectionId, clientSocket, logger, eventListener, userManager).run();
+                                    connectionId, clientSocket, logger, eventListener,
+                                    userManager, accountStore, groupManager).run();
                         } finally {
                             activeSockets.remove(clientSocket);
                         }
@@ -118,6 +137,7 @@ public final class ChatServer implements AutoCloseable {
             throw failure;
         } finally {
             running.set(false);
+            closeDiscoveryResponder();
             closeServerSocket();
             started.countDown();
             logger.info("Server accept loop stopped");
@@ -164,6 +184,7 @@ public final class ChatServer implements AutoCloseable {
             return;
         }
         closeServerSocket();
+        closeDiscoveryResponder();
         closeActiveSockets();
         clientPool.shutdown();
         try {
@@ -192,6 +213,14 @@ public final class ChatServer implements AutoCloseable {
             } catch (IOException failure) {
                 logger.log(Level.WARNING, "Could not close server socket", failure);
             }
+        }
+    }
+
+    private void closeDiscoveryResponder() {
+        LanDiscoveryResponder responder = discoveryResponder;
+        discoveryResponder = null;
+        if (responder != null) {
+            responder.close();
         }
     }
 

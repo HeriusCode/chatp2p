@@ -2,6 +2,8 @@ package chatp2p.client;
 
 import chatp2p.model.ChatMessage;
 import chatp2p.model.FileInfo;
+import chatp2p.model.GroupInfo;
+import chatp2p.model.GroupMessage;
 import chatp2p.model.PeerInfo;
 import chatp2p.model.TransferProgress;
 
@@ -14,6 +16,12 @@ public interface ClientEventListener {
     }
 
     default void onChatReceived(ChatMessage message) {
+    }
+
+    default void onGroupsChanged(List<GroupInfo> groups) {
+    }
+
+    default void onGroupChatReceived(GroupMessage message) {
     }
 
     default void onConnectionError(String message) {

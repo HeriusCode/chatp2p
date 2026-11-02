@@ -1,6 +1,6 @@
 package chatp2p.server;
 
-import chatp2p.view.ConnectionFrame;
+import chatp2p.view.LoginFrame;
 import chatp2p.view.ServerDashboardFrame;
 
 import java.awt.GraphicsEnvironment;
@@ -45,7 +45,7 @@ public final class ServerMain {
             return;
         }
         SwingUtilities.invokeLater(() -> {
-            ConnectionFrame.installLookAndFeel();
+            LoginFrame.installLookAndFeel();
             new ServerDashboardFrame().setVisible(true);
         });
     }

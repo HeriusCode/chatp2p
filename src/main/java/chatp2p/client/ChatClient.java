@@ -2,6 +2,8 @@ package chatp2p.client;
 
 import chatp2p.model.ChatMessage;
 import chatp2p.model.FileInfo;
+import chatp2p.model.GroupInfo;
+import chatp2p.model.GroupMessage;
 import chatp2p.model.PeerInfo;
 import chatp2p.model.TransferProgress;
 import chatp2p.protocol.MessageType;
@@ -15,7 +17,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.Arrays;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -38,18 +42,32 @@ public final class ChatClient implements AutoCloseable {
     private volatile ServerConnection connection;
     private volatile PeerServer peerServer;
     private volatile FileTransferManager fileTransferManager;
+    private volatile MulticastGroupChannel multicastChannel;
+    private final ConcurrentHashMap<UUID, Boolean> seenGroupMessages = new ConcurrentHashMap<>();
     private volatile List<PeerInfo> onlineUsers = List.of();
+    private volatile List<GroupInfo> groups = List.of();
     private volatile String clientName;
     private volatile int peerPort;
 
     public void connect(String host, int port, String requestedClientName) throws IOException {
-        connect(host, port, requestedClientName, 0);
+        throw new IllegalArgumentException("Password is required");
     }
 
     public void connect(
-            String host, int port, String requestedClientName, int requestedPeerPort)
+            String host, int port, String requestedClientName, String password)
+            throws IOException {
+        connect(host, port, requestedClientName, password, 0);
+    }
+
+    public void connect(
+            String host, int port, String requestedClientName, String password,
+            int requestedPeerPort)
             throws IOException {
         validateConnectionArguments(host, port, requestedClientName, requestedPeerPort);
+        char[] passwordChars = password == null ? new char[0] : password.toCharArray();
+        if (passwordChars.length < 6 || passwordChars.length > 128) {
+            throw new IllegalArgumentException("Mật khẩu phải có 6-128 ký tự");
+        }
         if (!state.compareAndSet(ConnectionState.DISCONNECTED, ConnectionState.CONNECTING)) {
             throw new IllegalStateException("Client is already connected or connecting");
         }
@@ -69,16 +87,26 @@ public final class ChatClient implements AutoCloseable {
             peerPort = newPeerServer.start(requestedPeerPort);
             newConnection.setEventListener(this::handleServerEvent);
             newConnection.connect(host, port);
-            ProtocolMessage hello = ProtocolMessage.builder(MessageType.HELLO)
-                    .field("clientName", requestedClientName)
-                    .field("clientVersion", "1.0")
+            ProtocolMessage login = ProtocolMessage.builder(MessageType.LOGIN)
+                    .field("username", requestedClientName)
+                    .field("password", password)
                     .field("peerPort", Integer.toString(peerPort))
                     .build();
-            ProtocolMessage response = newConnection.request(hello, REQUEST_TIMEOUT);
-            requireType(response, MessageType.HELLO_ACK);
+            ProtocolMessage response = newConnection.request(login, REQUEST_TIMEOUT);
+            requireType(response, MessageType.LOGIN_ACK);
             clientName = requestedClientName;
             state.set(ConnectionState.CONNECTED);
+            try {
+                MulticastGroupChannel channel =
+                        new MulticastGroupChannel(message -> acceptGroupMessage(message, true));
+                channel.start();
+                multicastChannel = channel;
+            } catch (IOException multicastUnavailable) {
+                // Central Server delivery remains the reliable fallback channel.
+                multicastChannel = null;
+            }
             refreshUsers();
+            refreshGroups();
             heartbeatExecutor.scheduleAtFixedRate(
                     this::sendHeartbeat, 20, 30, TimeUnit.SECONDS);
         } catch (IOException | RuntimeException failure) {
@@ -90,6 +118,26 @@ public final class ChatClient implements AutoCloseable {
             fileTransferManager = null;
             state.set(ConnectionState.DISCONNECTED);
             throw failure;
+        } finally {
+            Arrays.fill(passwordChars, '\0');
+        }
+    }
+
+    public static void registerAccount(
+            String host, int port, String username, String password) throws IOException {
+        validateConnectionArguments(host, port, username, 0);
+        if (password == null || password.length() < 6 || password.length() > 128) {
+            throw new IllegalArgumentException("Mật khẩu phải có 6-128 ký tự");
+        }
+        try (ServerConnection registration = new ServerConnection()) {
+            registration.connect(host, port);
+            ProtocolMessage response = registration.request(
+                    ProtocolMessage.builder(MessageType.REGISTER)
+                            .field("username", username)
+                            .field("password", password)
+                            .build(),
+                    REQUEST_TIMEOUT);
+            requireType(response, MessageType.REGISTER_ACK);
         }
     }
 
@@ -133,14 +181,73 @@ public final class ChatClient implements AutoCloseable {
         applyUserList(response);
     }
 
+    public void refreshGroups() throws IOException {
+        ensureConnected();
+        ProtocolMessage response = connection.request(
+                ProtocolMessage.builder(MessageType.GET_GROUPS).build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.GROUP_LIST);
+        applyGroupList(response);
+    }
+
+    public void joinGroup(String groupName) throws IOException {
+        ensureConnected();
+        ProtocolMessage response = connection.request(
+                ProtocolMessage.builder(MessageType.JOIN_GROUP)
+                        .field("groupName", groupName.trim())
+                        .build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.JOIN_GROUP);
+        refreshGroups();
+    }
+
+    public void leaveGroup(String groupName) throws IOException {
+        ensureConnected();
+        ProtocolMessage response = connection.request(
+                ProtocolMessage.builder(MessageType.LEAVE_GROUP)
+                        .field("groupName", groupName)
+                        .build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.LEAVE_GROUP);
+        refreshGroups();
+    }
+
+    public GroupMessage sendGroupChat(String groupName, String content) throws IOException {
+        ensureConnected();
+        GroupMessage message = new GroupMessage(
+                UUID.randomUUID(), groupName, clientName,
+                content == null ? "" : content.trim(), Instant.now());
+        ProtocolMessage response = connection.request(
+                ProtocolMessage.builder(MessageType.GROUP_CHAT)
+                        .field("messageId", message.messageId().toString())
+                        .field("groupName", message.groupName())
+                        .field("sender", message.sender())
+                        .field("content", message.content())
+                        .field("timestamp", message.timestamp().toString())
+                        .build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.GROUP_CHAT);
+        seenGroupMessages.put(message.messageId(), Boolean.TRUE);
+        MulticastGroupChannel channel = multicastChannel;
+        if (channel != null) {
+            try {
+                channel.send(message);
+            } catch (IOException ignored) {
+                // The server has already delivered the message as fallback.
+            }
+        }
+        return message;
+    }
+
     public List<PeerInfo> onlineUsers() {
         return onlineUsers;
+    }
+
+    public List<GroupInfo> groups() {
+        return groups;
     }
 
     public void addEventListener(ClientEventListener listener) {
         if (listener != null) {
             listeners.addIfAbsent(listener);
             listener.onUsersChanged(onlineUsers);
+            listener.onGroupsChanged(groups);
         }
     }
 
@@ -188,10 +295,17 @@ public final class ChatClient implements AutoCloseable {
         if (currentFileManager != null) {
             currentFileManager.close();
         }
+        MulticastGroupChannel currentMulticast = multicastChannel;
+        if (currentMulticast != null) {
+            currentMulticast.close();
+        }
         connection = null;
         peerServer = null;
         fileTransferManager = null;
+        multicastChannel = null;
+        seenGroupMessages.clear();
         onlineUsers = List.of();
+        groups = List.of();
         state.set(ConnectionState.DISCONNECTED);
         heartbeatExecutor.shutdownNow();
     }
@@ -203,6 +317,83 @@ public final class ChatClient implements AutoCloseable {
             } catch (IOException invalidList) {
                 notifyConnectionError(invalidList.getMessage());
             }
+        } else if (message.type() == MessageType.GROUP_LIST) {
+            try {
+                applyGroupList(message);
+            } catch (IOException invalidList) {
+                notifyConnectionError(invalidList.getMessage());
+            }
+        } else if (message.type() == MessageType.GROUP_CHAT) {
+            try {
+                acceptGroupMessage(decodeGroupMessage(message), false);
+            } catch (IOException invalidMessage) {
+                notifyConnectionError(invalidMessage.getMessage());
+            }
+        }
+    }
+
+    private void acceptGroupMessage(GroupMessage message, boolean multicast) {
+        if (message == null || message.sender().equals(clientName)) {
+            return;
+        }
+        if (multicast && groups.stream().noneMatch(
+                group -> group.joined() && group.name().equals(message.groupName()))) {
+            return;
+        }
+        if (seenGroupMessages.putIfAbsent(message.messageId(), Boolean.TRUE) != null) {
+            return;
+        }
+        if (seenGroupMessages.size() > 4_096) {
+            seenGroupMessages.clear();
+            seenGroupMessages.put(message.messageId(), Boolean.TRUE);
+        }
+        for (ClientEventListener listener : listeners) {
+            listener.onGroupChatReceived(message);
+        }
+    }
+
+    public boolean multicastAvailable() {
+        return multicastChannel != null;
+    }
+
+    private void applyGroupList(ProtocolMessage message) throws IOException {
+        int count;
+        try {
+            count = Integer.parseInt(message.requiredField("count"));
+        } catch (NumberFormatException invalidCount) {
+            throw new IOException("Invalid GROUP_LIST count", invalidCount);
+        }
+        if (count < 0 || count > 256) {
+            throw new IOException("Invalid GROUP_LIST size: " + count);
+        }
+        List<GroupInfo> updated = new ArrayList<>();
+        for (int index = 0; index < count; index++) {
+            String prefix = "group." + index;
+            try {
+                updated.add(new GroupInfo(
+                        message.requiredField(prefix + ".name"),
+                        Integer.parseInt(message.requiredField(prefix + ".members")),
+                        Boolean.parseBoolean(message.requiredField(prefix + ".joined"))));
+            } catch (NumberFormatException invalidMembers) {
+                throw new IOException("Invalid group member count", invalidMembers);
+            }
+        }
+        groups = List.copyOf(updated);
+        for (ClientEventListener listener : listeners) {
+            listener.onGroupsChanged(groups);
+        }
+    }
+
+    private static GroupMessage decodeGroupMessage(ProtocolMessage message) throws IOException {
+        try {
+            return new GroupMessage(
+                    UUID.fromString(message.requiredField("messageId")),
+                    message.requiredField("groupName"),
+                    message.requiredField("sender"),
+                    message.requiredField("content"),
+                    Instant.parse(message.requiredField("timestamp")));
+        } catch (IllegalArgumentException invalidMessage) {
+            throw new IOException("Invalid GROUP_CHAT message", invalidMessage);
         }
     }
 

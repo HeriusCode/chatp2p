@@ -1,5 +1,6 @@
 package chatp2p.server;
 
+import chatp2p.model.GroupMessage;
 import chatp2p.protocol.MessageType;
 import chatp2p.protocol.Protocol;
 import chatp2p.protocol.ProtocolException;
@@ -14,21 +15,23 @@ import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /** Handles one client socket independently from all other clients. */
 final class ClientHandler implements Runnable {
-    private static final int MAX_CLIENT_NAME_LENGTH = 64;
-
     private final long connectionId;
     private final Socket socket;
     private final Logger logger;
     private final ServerEventListener eventListener;
     private final UserManager userManager;
+    private final AccountStore accountStore;
+    private final GroupManager groupManager;
     private final String remoteAddress;
     private String clientName;
-    private boolean handshakeComplete;
+    private boolean authenticated;
     private volatile DataOutputStream activeOutput;
 
     ClientHandler(
@@ -36,12 +39,16 @@ final class ClientHandler implements Runnable {
             Socket socket,
             Logger logger,
             ServerEventListener eventListener,
-            UserManager userManager) {
+            UserManager userManager,
+            AccountStore accountStore,
+            GroupManager groupManager) {
         this.connectionId = connectionId;
         this.socket = socket;
         this.logger = logger;
         this.eventListener = eventListener;
         this.userManager = userManager;
+        this.accountStore = accountStore;
+        this.groupManager = groupManager;
         this.remoteAddress = socket.getRemoteSocketAddress().toString();
     }
 
@@ -75,10 +82,12 @@ final class ClientHandler implements Runnable {
             logger.log(Level.SEVERE, label() + " unexpected error", failure);
             publish(ServerEvent.Type.ERROR, "Unexpected error: " + failure.getMessage());
         } finally {
+            groupManager.removeUser(clientName);
             userManager.unregister(clientName, this);
             activeOutput = null;
-            if (handshakeComplete) {
+            if (authenticated) {
                 userManager.broadcastUserList();
+                groupManager.broadcastLists();
             }
             logger.info(label() + " handler stopped");
             publish(ServerEvent.Type.CLIENT_DISCONNECTED, "Client disconnected");
@@ -86,13 +95,18 @@ final class ClientHandler implements Runnable {
     }
 
     private boolean process(ProtocolMessage message, DataOutputStream output) throws IOException {
-        if (!handshakeComplete && message.type() != MessageType.HELLO) {
-            sendError(output, message, "HANDSHAKE_REQUIRED", "HELLO must be the first message");
-            return false;
+        if (!authenticated) {
+            return switch (message.type()) {
+                case REGISTER -> handleRegister(message, output);
+                case LOGIN -> handleLogin(message, output);
+                default -> {
+                    sendError(output, message, "AUTH_REQUIRED", "Đăng nhập trước khi sử dụng");
+                    yield true;
+                }
+            };
         }
 
         return switch (message.type()) {
-            case HELLO -> handleHello(message, output);
             case PING -> {
                 ProtocolMessage response = ProtocolMessage.responseTo(message, MessageType.PONG)
                         .field("sentAt", valueOrEmpty(message.field("sentAt")))
@@ -113,7 +127,24 @@ final class ClientHandler implements Runnable {
                 sendPeerInfo(message);
                 yield true;
             }
-            case HELLO_ACK, PONG, ERROR, USER_LIST, PEER_INFO, CHAT,
+            case GET_GROUPS -> {
+                send(groupManager.buildList(message, clientName));
+                yield true;
+            }
+            case JOIN_GROUP -> {
+                handleJoinGroup(message);
+                yield true;
+            }
+            case LEAVE_GROUP -> {
+                handleLeaveGroup(message);
+                yield true;
+            }
+            case GROUP_CHAT -> {
+                handleGroupChat(message, output);
+                yield true;
+            }
+            case HELLO, HELLO_ACK, REGISTER, REGISTER_ACK, LOGIN, LOGIN_ACK,
+                    PONG, ERROR, USER_LIST, PEER_INFO, CHAT, GROUP_LIST,
                     FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL -> {
                 sendError(output, message, "UNEXPECTED_MESSAGE",
                         "Server cannot accept " + message.type() + " from a client");
@@ -122,18 +153,43 @@ final class ClientHandler implements Runnable {
         };
     }
 
-    private boolean handleHello(ProtocolMessage message, DataOutputStream output) throws IOException {
-        if (handshakeComplete) {
-            sendError(output, message, "DUPLICATE_HELLO", "Handshake is already complete");
-            return true;
+    private boolean handleRegister(ProtocolMessage message, DataOutputStream output) throws IOException {
+        String username = message.requiredField("username").trim();
+        char[] password = message.requiredField("password").toCharArray();
+        try {
+            AccountStore.RegistrationResult result = accountStore.register(username, password);
+            if (result == AccountStore.RegistrationResult.USERNAME_EXISTS) {
+                sendError(output, message, "USERNAME_EXISTS", "Tên đăng nhập đã tồn tại");
+            } else {
+                send(ProtocolMessage.responseTo(message, MessageType.REGISTER_ACK)
+                        .field("message", "Đăng ký thành công")
+                        .build());
+                logger.info("Account registered: " + username);
+            }
+        } catch (IllegalArgumentException invalidInput) {
+            sendError(output, message, "INVALID_ACCOUNT", invalidInput.getMessage());
+        } finally {
+            Arrays.fill(password, '\0');
         }
+        return true;
+    }
 
-        String requestedName = message.requiredField("clientName").trim();
-        if (requestedName.length() > MAX_CLIENT_NAME_LENGTH
-                || !requestedName.matches("[\\p{L}\\p{N}_.-]+")) {
-            sendError(output, message, "INVALID_CLIENT_NAME",
-                    "Client name must be 1-64 letters, digits, dot, underscore or hyphen");
-            return false;
+    private boolean handleLogin(ProtocolMessage message, DataOutputStream output) throws IOException {
+        String requestedName = message.requiredField("username").trim();
+        char[] password = message.requiredField("password").toCharArray();
+        boolean valid;
+        try {
+            AccountStore.validateUsername(requestedName);
+            valid = accountStore.authenticate(requestedName, password);
+        } catch (IllegalArgumentException invalidInput) {
+            sendError(output, message, "INVALID_ACCOUNT", invalidInput.getMessage());
+            return true;
+        } finally {
+            Arrays.fill(password, '\0');
+        }
+        if (!valid) {
+            sendError(output, message, "LOGIN_FAILED", "Sai tên đăng nhập hoặc mật khẩu");
+            return true;
         }
 
         int peerPort;
@@ -150,21 +206,81 @@ final class ClientHandler implements Runnable {
 
         String peerHost = socket.getInetAddress().getHostAddress();
         if (!userManager.register(requestedName, peerHost, peerPort, this)) {
-            sendError(output, message, "USERNAME_ONLINE", "This username is already online");
-            return false;
+            sendError(output, message, "USERNAME_ONLINE", "Tài khoản đang đăng nhập ở thiết bị khác");
+            return true;
         }
 
         clientName = requestedName;
-        handshakeComplete = true;
-        ProtocolMessage response = ProtocolMessage.responseTo(message, MessageType.HELLO_ACK)
-                .field("message", "Connected to ChatP2P control server")
+        authenticated = true;
+        ProtocolMessage response = ProtocolMessage.responseTo(message, MessageType.LOGIN_ACK)
+                .field("message", "Đăng nhập thành công")
                 .field("remoteAddress", socket.getRemoteSocketAddress().toString())
                 .build();
         send(response);
-        logger.info(label() + " handshake completed");
-        publish(ServerEvent.Type.HANDSHAKE_COMPLETED, "Handshake completed");
+        logger.info(label() + " logged in");
+        publish(ServerEvent.Type.HANDSHAKE_COMPLETED, "Login completed");
         userManager.broadcastUserList();
+        groupManager.broadcastLists();
         return true;
+    }
+
+    private void handleJoinGroup(ProtocolMessage request) throws IOException {
+        String groupName = request.requiredField("groupName").trim();
+        try {
+            groupManager.join(clientName, groupName);
+        } catch (IllegalArgumentException invalidName) {
+            sendError(output(), request, "INVALID_GROUP", invalidName.getMessage());
+            return;
+        }
+        send(ProtocolMessage.responseTo(request, MessageType.JOIN_GROUP)
+                .field("status", "JOINED")
+                .field("groupName", groupName)
+                .build());
+        logger.info(clientName + " joined group " + groupName);
+        groupManager.broadcastLists();
+    }
+
+    private void handleLeaveGroup(ProtocolMessage request) throws IOException {
+        String groupName = request.requiredField("groupName").trim();
+        if (!groupManager.leave(clientName, groupName)) {
+            sendError(output(), request, "NOT_A_MEMBER", "Bạn chưa tham gia nhóm " + groupName);
+            return;
+        }
+        send(ProtocolMessage.responseTo(request, MessageType.LEAVE_GROUP)
+                .field("status", "LEFT")
+                .field("groupName", groupName)
+                .build());
+        logger.info(clientName + " left group " + groupName);
+        groupManager.broadcastLists();
+    }
+
+    private void handleGroupChat(ProtocolMessage request, DataOutputStream output) throws IOException {
+        GroupMessage groupMessage;
+        try {
+            groupMessage = new GroupMessage(
+                    UUID.fromString(request.requiredField("messageId")),
+                    request.requiredField("groupName"),
+                    request.requiredField("sender"),
+                    request.requiredField("content"),
+                    Instant.parse(request.requiredField("timestamp")));
+        } catch (IOException | IllegalArgumentException invalidMessage) {
+            sendError(output, request, "INVALID_GROUP_CHAT", "Tin nhắn nhóm không hợp lệ");
+            return;
+        }
+        if (!clientName.equals(groupMessage.sender())) {
+            sendError(output, request, "SENDER_MISMATCH", "Người gửi không khớp phiên đăng nhập");
+            return;
+        }
+        try {
+            groupManager.deliver(groupMessage);
+        } catch (IOException notMember) {
+            sendError(output, request, "NOT_A_MEMBER", notMember.getMessage());
+            return;
+        }
+        send(ProtocolMessage.responseTo(request, MessageType.GROUP_CHAT)
+                .field("status", "DELIVERED")
+                .build());
+        logger.info(clientName + " -> group " + groupMessage.groupName() + " CHAT");
     }
 
     private void sendUserList(ProtocolMessage request) throws IOException {
