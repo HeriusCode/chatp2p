@@ -27,12 +27,14 @@ import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GradientPaint;
 import java.awt.GridLayout;
 import java.awt.Insets;
 import java.awt.Polygon;
 import java.awt.RenderingHints;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
+import java.awt.event.ActionEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.IOException;
@@ -57,6 +59,7 @@ import javax.sound.sampled.Clip;
 import javax.sound.sampled.LineEvent;
 import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
+import javax.swing.AbstractAction;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.DefaultListCellRenderer;
@@ -64,13 +67,14 @@ import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
+import javax.swing.Icon;
 import javax.swing.ImageIcon;
 import javax.swing.JLabel;
 import javax.swing.JList;
+import javax.swing.KeyStroke;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
-import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTextField;
@@ -132,9 +136,11 @@ public final class MainFrame extends JFrame {
     // Chat Area components
     private final JPanel messagesPanel = new JPanel();
     private final JScrollPane messagesScroll = new JScrollPane(messagesPanel);
-    private final PlaceholderTextField messageField = new PlaceholderTextField("Nhập tin nhắn... (Enter để gửi)");
+    private final EmojiTextPane messageField = new EmojiTextPane("Nhập tin nhắn... (Enter để gửi)");
     private final ComposerIconButton emojiButton =
-            new ComposerIconButton(ComposerIcon.SMILE, "Biểu cảm");
+            new ComposerIconButton(ComposerIcon.SMILE, "Sticker & Biểu cảm (Zalo)");
+    private final ComposerIconButton gifButton =
+            new ComposerIconButton(ComposerIcon.GIF, "Ảnh động GIF");
     private final ComposerIconButton fileButton =
             new ComposerIconButton(ComposerIcon.ATTACH, "Gửi file P2P");
     private final ComposerIconButton audioButton =
@@ -534,12 +540,14 @@ public final class MainFrame extends JFrame {
         leftActions.add(audioButton);
         leftActions.add(videoButton);
         leftActions.add(emojiButton);
+        leftActions.add(gifButton);
 
         // Center input field
         messageField.setFont(new Font("Segoe UI", Font.PLAIN, 14));
         messageField.setForeground(UiTheme.NAVY);
         messageField.setCaretColor(UiTheme.PRIMARY);
         messageField.setBackground(new Color(241, 243, 246));
+        messageField.setOpaque(true);
         messageField.setBorder(BorderFactory.createCompoundBorder(
                 new RoundedBorder(new Color(226, 230, 238), 20),
                 BorderFactory.createEmptyBorder(9, 16, 9, 16)));
@@ -575,9 +583,16 @@ public final class MainFrame extends JFrame {
         joinGroupButton.addActionListener(event -> joinGroup());
         groupNameField.addActionListener(event -> joinGroup());
         leaveGroupButton.addActionListener(event -> leaveSelectedGroup());
-        emojiButton.addActionListener(event -> showEmojiPicker());
+        emojiButton.addActionListener(event -> showMediaPopover(emojiButton, ZaloMediaPopover.TabType.EMOJI));
+        gifButton.addActionListener(event -> showMediaPopover(gifButton, ZaloMediaPopover.TabType.GIF));
         sendButton.addActionListener(event -> sendMessage());
-        messageField.addActionListener(event -> sendMessage());
+        messageField.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "sendMessage");
+        messageField.getActionMap().put("sendMessage", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent event) {
+                sendMessage();
+            }
+        });
         fileButton.addActionListener(event -> chooseAndSendFile());
         audioButton.addActionListener(event -> toggleAudioRecording());
         videoButton.addActionListener(event -> chooseAndSendVideo());
@@ -757,7 +772,7 @@ public final class MainFrame extends JFrame {
     private void sendMessage() {
         PeerInfo peer = selectedPeer;
         GroupInfo group = selectedGroup;
-        String text = messageField.getText().trim();
+        String text = messageField.messageText().trim();
         if ((peer == null && group == null) || text.isEmpty()) {
             return;
         }
@@ -790,37 +805,52 @@ public final class MainFrame extends JFrame {
         }.execute();
     }
 
-    private void showEmojiPicker() {
-        String[] emojis = {
-                "😀", "😂", "😊", "😍", "🥰", "😎", "🤔", "😢",
-                "😭", "😡", "👍", "👎", "👏", "🙏", "💪", "🎉",
-                "❤️", "💙", "🔥", "✨", "✅", "👋", "🤝", "💯"
-        };
-        JPopupMenu picker = new JPopupMenu();
-        picker.setBorder(BorderFactory.createCompoundBorder(
-                new RoundedBorder(UiTheme.BORDER, 12),
-                BorderFactory.createEmptyBorder(6, 6, 6, 6)));
-        JPanel grid = UiTheme.panel(new GridLayout(4, 6, 4, 4), UiTheme.WHITE);
-        for (String emoji : emojis) {
-            JButton item = new JButton(emoji);
-            item.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 20));
-            item.setPreferredSize(new Dimension(40, 36));
-            item.setFocusPainted(false);
-            item.setBorderPainted(false);
-            item.setBackground(UiTheme.WHITE);
-            item.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            item.addActionListener(event -> {
-                int caret = messageField.getCaretPosition();
-                String current = messageField.getText();
-                messageField.setText(current.substring(0, caret) + emoji + current.substring(caret));
-                messageField.setCaretPosition(caret + emoji.length());
-                messageField.requestFocusInWindow();
-                picker.setVisible(false);
-            });
-            grid.add(item);
+    private void showMediaPopover(Component anchor, ZaloMediaPopover.TabType defaultTab) {
+        PeerInfo peer = selectedPeer;
+        GroupInfo group = selectedGroup;
+        if (peer == null && group == null) {
+            return;
         }
-        picker.add(grid);
-        picker.show(emojiButton, 0, -grid.getPreferredSize().height - 10);
+        ZaloMediaPopover popover = new ZaloMediaPopover(
+                this::sendMediaMessage,
+                emojiId -> {
+                    messageField.insertEmoji(emojiId);
+                    messageField.requestFocusInWindow();
+                });
+        popover.selectTab(defaultTab);
+        popover.show(anchor, 0, -popover.getPreferredSize().height - 10);
+    }
+
+    private void sendMediaMessage(String payload) {
+        PeerInfo peer = selectedPeer;
+        GroupInfo group = selectedGroup;
+        if ((peer == null && group == null) || payload == null || payload.isBlank()) {
+            return;
+        }
+        new SwingWorker<Object, Void>() {
+            @Override
+            protected Object doInBackground() throws Exception {
+                return group != null
+                        ? client.sendGroupChat(group.name(), payload)
+                        : client.sendChat(peer.username(), payload);
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    Object sent = get();
+                    if (sent instanceof ChatMessage chatMessage) {
+                        addMessage(chatMessage);
+                    } else if (sent instanceof GroupMessage groupMessage) {
+                        addGroupMessage(groupMessage);
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    showError(friendlyMessage(failure.getCause()));
+                }
+            }
+        }.execute();
     }
 
     private void chooseAndSendFile() {
@@ -1042,6 +1072,18 @@ public final class MainFrame extends JFrame {
 
     private JPanel createGroupMessageBubble(GroupMessage message) {
         boolean mine = message.sender().equals(client.clientName());
+        if (ZaloMedia.isEmoji(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.EMOJI, true);
+        }
+        if (ZaloMedia.isSticker(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.STICKER, true);
+        }
+        if (ZaloMedia.isGif(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.GIF, true);
+        }
         JPanel row = UiTheme.panel(new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0), UiTheme.CHAT_BG);
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 130));
 
@@ -1078,10 +1120,7 @@ public final class MainFrame extends JFrame {
             bubble.add(Box.createVerticalStrut(2));
         }
 
-        JLabel content = UiTheme.label(
-                "<html><div style='width:310px; word-wrap: break-word;'>"
-                        + escapeHtml(message.content()) + "</div></html>",
-                UiTheme.BODY, mine ? UiTheme.WHITE : UiTheme.NAVY);
+        EmojiTextPane content = createRichMessageContent(message.content(), mine);
         JLabel time = UiTheme.label(
                 MESSAGE_TIME.format(message.timestamp()),
                 new Font("Segoe UI", Font.PLAIN, 10),
@@ -1099,8 +1138,88 @@ public final class MainFrame extends JFrame {
         return row;
     }
 
+    private JPanel createMediaBubble(
+            String sender, Instant timestamp, boolean mine, String mediaId, ChatMediaType mediaType, boolean isGroup) {
+        JPanel row = UiTheme.panel(
+                new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0),
+                UiTheme.CHAT_BG);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, mediaType == ChatMediaType.EMOJI ? 90 : 170));
+
+        if (!mine) {
+            JPanel miniAvatar = new JPanel() {
+                @Override
+                protected void paintComponent(Graphics g) {
+                    super.paintComponent(g);
+                    Graphics2D g2 = (Graphics2D) g.create();
+                    try {
+                        UiTheme.drawAvatar(g2, sender, 0, 0, 30, false, false);
+                    } finally {
+                        g2.dispose();
+                    }
+                }
+            };
+            miniAvatar.setPreferredSize(new Dimension(30, 30));
+            miniAvatar.setOpaque(false);
+            row.add(miniAvatar);
+            row.add(Box.createHorizontalStrut(8));
+        }
+
+        JPanel card = new JPanel();
+        card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
+        card.setOpaque(false);
+
+        if (!mine && isGroup) {
+            JLabel senderLabel = UiTheme.label(
+                    sender,
+                    new Font("Segoe UI", Font.BOLD, 11),
+                    UiTheme.getAvatarColor(sender));
+            senderLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            card.add(senderLabel);
+            card.add(Box.createVerticalStrut(3));
+        }
+
+        Icon icon = switch (mediaType) {
+            case EMOJI -> ZaloMedia.getEmojiIcon(mediaId);
+            case STICKER -> ZaloMedia.getStickerIcon(mediaId);
+            case GIF -> ZaloMedia.getGifIcon(mediaId);
+        };
+        JLabel mediaLabel;
+        if (icon != null) {
+            mediaLabel = new JLabel(icon);
+        } else {
+            mediaLabel = UiTheme.label(
+                    "[" + mediaType.name() + ": " + mediaId + "]",
+                    UiTheme.BODY, mine ? UiTheme.PRIMARY : UiTheme.NAVY);
+        }
+        mediaLabel.setAlignmentX(mine ? Component.RIGHT_ALIGNMENT : Component.LEFT_ALIGNMENT);
+        card.add(mediaLabel);
+
+        JLabel time = UiTheme.label(
+                MESSAGE_TIME.format(timestamp),
+                new Font("Segoe UI", Font.PLAIN, 10),
+                UiTheme.MUTED);
+        time.setAlignmentX(mine ? Component.RIGHT_ALIGNMENT : Component.LEFT_ALIGNMENT);
+        card.add(Box.createVerticalStrut(3));
+        card.add(time);
+
+        row.add(card);
+        return row;
+    }
+
     private JPanel createMessageBubble(ChatMessage message) {
         boolean mine = message.sender().equals(client.clientName());
+        if (ZaloMedia.isEmoji(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.EMOJI, false);
+        }
+        if (ZaloMedia.isSticker(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.STICKER, false);
+        }
+        if (ZaloMedia.isGif(message.content())) {
+            return createMediaBubble(message.sender(), message.timestamp(), mine,
+                    ZaloMedia.extractMediaId(message.content()), ChatMediaType.GIF, false);
+        }
         JPanel row = UiTheme.panel(new FlowLayout(mine ? FlowLayout.RIGHT : FlowLayout.LEFT, 0, 0), UiTheme.CHAT_BG);
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
 
@@ -1128,10 +1247,7 @@ public final class MainFrame extends JFrame {
         bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
         bubble.setBorder(BorderFactory.createEmptyBorder(9, 14, 9, 14));
 
-        JLabel content = UiTheme.label(
-                "<html><div style='width:310px; word-wrap: break-word;'>"
-                        + escapeHtml(message.content()) + "</div></html>",
-                UiTheme.BODY, mine ? UiTheme.WHITE : UiTheme.NAVY);
+        EmojiTextPane content = createRichMessageContent(message.content(), mine);
         JLabel time = UiTheme.label(
                 MESSAGE_TIME.format(message.timestamp()),
                 new Font("Segoe UI", Font.PLAIN, 10),
@@ -1147,6 +1263,19 @@ public final class MainFrame extends JFrame {
         bubble.add(time);
         row.add(bubble);
         return row;
+    }
+
+    private EmojiTextPane createRichMessageContent(String text, boolean mine) {
+        EmojiTextPane content = new EmojiTextPane(null);
+        content.setFont(UiTheme.BODY);
+        content.showMessage(text, mine ? UiTheme.WHITE : UiTheme.NAVY);
+        content.setEditable(false);
+        content.setFocusable(false);
+        content.setBorder(null);
+        content.setSize(310, Short.MAX_VALUE);
+        Dimension preferred = content.getPreferredSize();
+        content.setPreferredSize(new Dimension(310, Math.max(28, preferred.height)));
+        return content;
     }
 
     private JPanel createFileBubble(FileEntry entry) {
@@ -1696,6 +1825,7 @@ public final class MainFrame extends JFrame {
         messageField.setEnabled(enabled);
         sendButton.setEnabled(enabled);
         emojiButton.setEnabled(enabled);
+        gifButton.setEnabled(enabled);
         fileButton.setEnabled(enabled && selectedPeer != null);
         audioButton.setEnabled(audioRecorder.isRecording()
                 || (enabled && selectedPeer != null));
@@ -1739,13 +1869,6 @@ public final class MainFrame extends JFrame {
         return failure == null || failure.getMessage() == null
                 ? "Thao tác mạng gặp sự cố"
                 : failure.getMessage();
-    }
-
-    private static String escapeHtml(String value) {
-        return value.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace("\n", "<br>");
     }
 
     private static String formatBytes(long bytes) {
@@ -1940,9 +2063,16 @@ public final class MainFrame extends JFrame {
     private enum ComposerIcon {
         ATTACH,
         SMILE,
+        GIF,
         MICROPHONE,
         VIDEO,
         SEND
+    }
+
+    private enum ChatMediaType {
+        EMOJI,
+        STICKER,
+        GIF
     }
 
     /** Vector composer button that does not depend on emoji fonts. */
@@ -1994,10 +2124,48 @@ public final class MainFrame extends JFrame {
                         canvas.drawRoundRect(centerX - 3, centerY - 8, 6, 16, 6, 6);
                     }
                     case SMILE -> {
-                        canvas.drawOval(centerX - 10, centerY - 10, 20, 20);
-                        canvas.fillOval(centerX - 5, centerY - 4, 2, 3);
-                        canvas.fillOval(centerX + 3, centerY - 4, 2, 3);
-                        canvas.drawArc(centerX - 5, centerY - 2, 10, 8, 200, 140);
+                        // 3D Glossy Yellow Face
+                        int r = 10;
+                        GradientPaint faceGrad = new GradientPaint(
+                                centerX, centerY - r, new Color(255, 225, 53),
+                                centerX, centerY + r, new Color(245, 158, 11));
+                        canvas.setPaint(faceGrad);
+                        canvas.fillOval(centerX - r, centerY - r, r * 2, r * 2);
+                        // Gloss highlight
+                        canvas.setColor(new Color(255, 255, 255, 160));
+                        canvas.fillOval(centerX - 6, centerY - r + 2, 12, 5);
+                        // Border
+                        canvas.setColor(new Color(180, 83, 9, 90));
+                        canvas.setStroke(new BasicStroke(1.1f));
+                        canvas.drawOval(centerX - r, centerY - r, r * 2, r * 2);
+                        // Eyes
+                        canvas.setColor(new Color(60, 30, 10));
+                        canvas.fillOval(centerX - 5, centerY - 3, 3, 3);
+                        canvas.fillOval(centerX + 2, centerY - 3, 3, 3);
+                        // Smile
+                        canvas.setStroke(new BasicStroke(1.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                        canvas.drawArc(centerX - 5, centerY - 2, 10, 7, 200, 140);
+                        // Blush
+                        canvas.setColor(new Color(244, 63, 94, 130));
+                        canvas.fillOval(centerX - 8, centerY, 3, 2);
+                        canvas.fillOval(centerX + 5, centerY, 3, 2);
+                    }
+                    case GIF -> {
+                        int bw = 24;
+                        int bh = 17;
+                        int bx = centerX - bw / 2;
+                        int by = centerY - bh / 2;
+                        GradientPaint gifGrad = new GradientPaint(
+                                bx, by, new Color(14, 165, 233),
+                                bx + bw, by + bh, new Color(37, 99, 235));
+                        canvas.setPaint(gifGrad);
+                        canvas.fillRoundRect(bx, by, bw, bh, 6, 6);
+                        canvas.setColor(Color.WHITE);
+                        canvas.setFont(new Font("Segoe UI", Font.BOLD, 10));
+                        FontMetrics fm = canvas.getFontMetrics();
+                        int tx = bx + (bw - fm.stringWidth("GIF")) / 2;
+                        int ty = by + (bh - fm.getHeight()) / 2 + fm.getAscent();
+                        canvas.drawString("GIF", tx, ty);
                     }
                     case MICROPHONE -> {
                         canvas.drawRoundRect(centerX - 5, centerY - 11, 10, 17, 9, 9);
