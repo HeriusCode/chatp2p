@@ -2,6 +2,7 @@ package chatp2p.view;
 
 import chatp2p.client.AudioRecorder;
 import chatp2p.client.ChatClient;
+import chatp2p.client.ChatHistoryStore;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
 import chatp2p.client.TransferHandle;
@@ -45,6 +46,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -153,6 +155,9 @@ public final class MainFrame extends JFrame {
     // History tracking
     private final Map<String, List<ConversationEntry>> histories = new HashMap<>();
     private final Map<String, List<GroupMessage>> groupHistories = new HashMap<>();
+    private final Set<String> historyPeers = new HashSet<>();
+    private final Set<UUID> displayedMessageIds = new HashSet<>();
+    private final Set<UUID> displayedGroupIds = new HashSet<>();
     private final Map<UUID, FileEntry> fileEntries = new HashMap<>();
     private final Map<UUID, TransferHandle> outgoingTransfers = new HashMap<>();
     private final Map<UUID, Path> outgoingSourcePaths = new HashMap<>();
@@ -223,9 +228,10 @@ public final class MainFrame extends JFrame {
         }
     };
 
-    public MainFrame(ChatClient client) {
+    public MainFrame(ChatClient client, ChatHistoryStore.Snapshot savedHistory) {
         super("Chat P2P - " + client.clientName());
         this.client = client;
+        restoreHistory(savedHistory);
         setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         setMinimumSize(new Dimension(960, 640));
         setSize(1140, 750);
@@ -459,6 +465,15 @@ public final class MainFrame extends JFrame {
                 }
             }
         }
+        for (String name : historyPeers.stream().sorted().toList()) {
+            if (!isPeerOnline(name) && (query.isEmpty() || name.toLowerCase().contains(query))) {
+                PeerInfo offline = new PeerInfo(name, "offline", 1);
+                userModel.addElement(offline);
+                if (name.equals(currentSelectedUser)) {
+                    userList.setSelectedValue(offline, false);
+                }
+            }
+        }
 
         String currentSelectedGroupName = selectedGroup == null ? null : selectedGroup.name();
         groupModel.clear();
@@ -467,6 +482,16 @@ public final class MainFrame extends JFrame {
                 groupModel.addElement(group);
                 if (group.name().equals(currentSelectedGroupName)) {
                     groupList.setSelectedValue(group, false);
+                }
+            }
+        }
+        for (String name : groupHistories.keySet().stream().sorted().toList()) {
+            if (rawGroups.stream().noneMatch(group -> group.name().equals(name))
+                    && (query.isEmpty() || name.toLowerCase().contains(query))) {
+                GroupInfo archived = new GroupInfo(name, 0, false);
+                groupModel.addElement(archived);
+                if (name.equals(currentSelectedGroupName)) {
+                    groupList.setSelectedValue(archived, false);
                 }
             }
         }
@@ -605,7 +630,8 @@ public final class MainFrame extends JFrame {
 
         String selectedName = selectedPeer == null ? null : selectedPeer.username();
         PeerInfo restored = null;
-        for (PeerInfo peer : users) {
+        for (int index = 0; index < userModel.size(); index++) {
+            PeerInfo peer = userModel.get(index);
             if (peer.username().equals(selectedName)) {
                 restored = peer;
                 break;
@@ -614,10 +640,12 @@ public final class MainFrame extends JFrame {
         if (restored != null) {
             userList.setSelectedValue(restored, true);
             selectedPeer = restored;
+            selectPeer(restored);
         } else if (selectedName != null) {
             selectPeer(null);
         }
-        tabUsersButton.setText("Bạn bè (" + users.size() + ")");
+        long offlineCount = historyPeers.stream().filter(name -> !isPeerOnline(name)).count();
+        tabUsersButton.setText("Bạn bè (" + (users.size() + offlineCount) + ")");
     }
 
     private void selectPeer(PeerInfo peer) {
@@ -632,9 +660,15 @@ public final class MainFrame extends JFrame {
             setComposerEnabled(false);
         } else {
             chatTitle.setText(peer.username());
-            chatSubtitle.setText("● Đang hoạt động • P2P: " + peer.host() + ":" + peer.port());
-            chatSubtitle.setForeground(UiTheme.ONLINE_GREEN);
-            setComposerEnabled(client.state() == ConnectionState.CONNECTED);
+            if (isPeerOnline(peer.username())) {
+                chatSubtitle.setText("● Đang hoạt động • P2P: " + peer.host() + ":" + peer.port());
+                chatSubtitle.setForeground(UiTheme.ONLINE_GREEN);
+                setComposerEnabled(client.state() == ConnectionState.CONNECTED);
+            } else {
+                chatSubtitle.setText("Ngoại tuyến • Có thể xem lịch sử trò chuyện");
+                chatSubtitle.setForeground(UiTheme.MUTED);
+                setComposerEnabled(false);
+            }
         }
         renderHistory();
     }
@@ -646,21 +680,24 @@ public final class MainFrame extends JFrame {
 
         String selectedName = selectedGroup == null ? null : selectedGroup.name();
         GroupInfo restored = null;
-        for (GroupInfo group : groups) {
-            if (group.joined() && group.name().equals(selectedName)) {
+        for (int index = 0; index < groupModel.size(); index++) {
+            GroupInfo group = groupModel.get(index);
+            if (group.name().equals(selectedName)) {
                 restored = group;
                 break;
             }
         }
         if (restored != null) {
-            selectedGroup = restored;
             groupList.setSelectedValue(restored, true);
+            selectGroup(restored);
         } else if (selectedName != null) {
             selectedGroup = null;
             leaveGroupButton.setVisible(false);
             renderHistory();
         }
-        tabGroupsButton.setText("Nhóm (" + groups.size() + ")");
+        long archivedCount = groupHistories.keySet().stream()
+                .filter(name -> groups.stream().noneMatch(group -> group.name().equals(name))).count();
+        tabGroupsButton.setText("Nhóm (" + (groups.size() + archivedCount) + ")");
     }
 
     private void selectGroup(GroupInfo group) {
@@ -668,13 +705,13 @@ public final class MainFrame extends JFrame {
             return;
         }
         if (!group.joined()) {
-            selectedGroup = null;
+            selectedGroup = group;
             selectedPeer = null;
             userList.clearSelection();
             groupNameField.setText(group.name());
             chatTitle.setText("Nhóm #" + group.name());
             chatSubtitle.setForeground(UiTheme.SLATE);
-            chatSubtitle.setText("Chưa tham gia • Nhấn Tham gia để gửi tin");
+            chatSubtitle.setText("Lịch sử nhóm • Nhấn Tham gia để gửi tin");
             leaveGroupButton.setVisible(false);
             headerAvatarPanel.repaint();
             setComposerEnabled(false);
@@ -990,8 +1027,12 @@ public final class MainFrame extends JFrame {
     }
 
     private void addMessage(ChatMessage message) {
+        if (!displayedMessageIds.add(message.messageId())) {
+            return;
+        }
         String peerName = message.sender().equals(client.clientName())
                 ? message.receiver() : message.sender();
+        historyPeers.add(peerName);
         histories.computeIfAbsent(peerName, ignored -> new ArrayList<>())
                 .add(new TextEntry(message));
         if (selectedPeer != null && selectedPeer.username().equals(peerName)) {
@@ -1004,6 +1045,9 @@ public final class MainFrame extends JFrame {
     }
 
     private void addGroupMessage(GroupMessage message) {
+        if (!displayedGroupIds.add(message.messageId())) {
+            return;
+        }
         groupHistories.computeIfAbsent(message.groupName(), ignored -> new ArrayList<>())
                 .add(message);
         if (selectedGroup != null && selectedGroup.name().equals(message.groupName())) {
@@ -1013,6 +1057,48 @@ public final class MainFrame extends JFrame {
             messagesPanel.repaint();
             scrollToBottom();
         }
+    }
+
+    private void restoreHistory(ChatHistoryStore.Snapshot saved) {
+        if (saved == null) {
+            return;
+        }
+        for (ChatMessage message : saved.directMessages()) {
+            if (displayedMessageIds.add(message.messageId())) {
+                String peer = message.sender().equals(client.clientName())
+                        ? message.receiver() : message.sender();
+                historyPeers.add(peer);
+                histories.computeIfAbsent(peer, ignored -> new ArrayList<>()).add(new TextEntry(message));
+            }
+        }
+        for (GroupMessage message : saved.groupMessages()) {
+            if (displayedGroupIds.add(message.messageId())) {
+                groupHistories.computeIfAbsent(message.groupName(), ignored -> new ArrayList<>())
+                        .add(message);
+            }
+        }
+        for (ChatHistoryStore.StoredFile stored : saved.files()) {
+            FileEntry entry = new FileEntry(stored.file(), stored.direction(), stored.createdAt());
+            entry.progress = new TransferProgress(stored.file(), stored.direction(), stored.state(),
+                    stored.transferredBytes(), 0, 0, "Đã khôi phục từ lịch sử");
+            entry.sourcePath = stored.sourcePath();
+            entry.savedPath = stored.savedPath();
+            entry.downloadedPath = stored.downloadedPath();
+            entry.failureReason = stored.failureReason();
+            fileEntries.put(entry.file.fileId(), entry);
+            String peer = stored.direction() == TransferDirection.SENDING
+                    ? entry.file.receiver() : entry.file.sender();
+            historyPeers.add(peer);
+            histories.computeIfAbsent(peer, ignored -> new ArrayList<>()).add(entry);
+        }
+        for (List<ConversationEntry> conversation : histories.values()) {
+            conversation.sort(Comparator.comparing(entry -> entry instanceof TextEntry text
+                    ? text.message().timestamp() : ((FileEntry) entry).createdAt));
+        }
+    }
+
+    private boolean isPeerOnline(String username) {
+        return rawUsers.stream().anyMatch(peer -> peer.username().equals(username));
     }
 
     private void renderHistory() {
@@ -1678,6 +1764,7 @@ public final class MainFrame extends JFrame {
             fileEntries.put(progress.file().fileId(), entry);
             String peerName = progress.direction() == TransferDirection.SENDING
                     ? progress.file().receiver() : progress.file().sender();
+            historyPeers.add(peerName);
             histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
         }
         entry.progress = progress;
@@ -1706,6 +1793,7 @@ public final class MainFrame extends JFrame {
             fileEntries.put(file.fileId(), entry);
             String peerName = direction == TransferDirection.SENDING
                     ? file.receiver() : file.sender();
+            historyPeers.add(peerName);
             histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
         }
         if (entry.progress == null || entry.progress.state() != TransferState.CANCELLED) {
@@ -1728,7 +1816,9 @@ public final class MainFrame extends JFrame {
         entry.sourcePath = file;
         entry.failureReason = reason;
         fileEntries.put(info.fileId(), entry);
+        historyPeers.add(peer.username());
         histories.computeIfAbsent(peer.username(), ignored -> new ArrayList<>()).add(entry);
+        client.rememberFailedFile(info, file, reason);
         renderFileConversation(entry);
     }
 
@@ -1768,6 +1858,7 @@ public final class MainFrame extends JFrame {
                 entry.downloading = false;
                 try {
                     entry.downloadedPath = get();
+                    client.rememberDownloadedFile(entry.file.fileId(), entry.downloadedPath);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     entry.downloadError = "Đã dừng tải file";
@@ -2430,11 +2521,12 @@ public final class MainFrame extends JFrame {
     }
 
     /** Modern group list item renderer with circular avatar. */
-    private static final class GroupRenderer extends DefaultListCellRenderer {
+    private final class GroupRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(
                 JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
             GroupInfo group = (GroupInfo) value;
+            boolean archived = rawGroups.stream().noneMatch(live -> live.name().equals(group.name()));
             JPanel row = UiTheme.panel(new BorderLayout(12, 0),
                     isSelected ? UiTheme.SELECTION_BG : UiTheme.WHITE);
             row.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
@@ -2458,7 +2550,9 @@ public final class MainFrame extends JFrame {
             text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
             JLabel nameLabel = UiTheme.label(group.name(), UiTheme.BODY_BOLD, UiTheme.NAVY);
             JLabel memberLabel = UiTheme.label(
-                    group.memberCount() + " thành viên" + (group.joined() ? " • Đã tham gia" : ""),
+                    archived ? "Lịch sử nhóm • Chưa tham gia"
+                            : group.memberCount() + " thành viên"
+                                    + (group.joined() ? " • Đã tham gia" : " • Chưa tham gia"),
                     new Font("Segoe UI", Font.PLAIN, 12),
                     group.joined() ? UiTheme.SUCCESS : UiTheme.MUTED);
             text.add(nameLabel);
@@ -2472,11 +2566,12 @@ public final class MainFrame extends JFrame {
     }
 
     /** Modern user list item renderer with circular avatar and green online dot. */
-    private static final class UserRenderer extends DefaultListCellRenderer {
+    private final class UserRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(
                 JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
             PeerInfo peer = (PeerInfo) value;
+            boolean online = isPeerOnline(peer.username());
             JPanel row = UiTheme.panel(new BorderLayout(12, 0),
                     isSelected ? UiTheme.SELECTION_BG : UiTheme.WHITE);
             row.setBorder(BorderFactory.createEmptyBorder(10, 14, 10, 14));
@@ -2487,7 +2582,7 @@ public final class MainFrame extends JFrame {
                     super.paintComponent(g);
                     Graphics2D g2 = (Graphics2D) g.create();
                     try {
-                        UiTheme.drawAvatar(g2, peer.username(), 0, 0, 44, false, true);
+                        UiTheme.drawAvatar(g2, peer.username(), 0, 0, 44, false, online);
                     } finally {
                         g2.dispose();
                     }
@@ -2500,7 +2595,8 @@ public final class MainFrame extends JFrame {
             text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
             JLabel nameLabel = UiTheme.label(peer.username(), UiTheme.BODY_BOLD, UiTheme.NAVY);
             JLabel infoLabel = UiTheme.label(
-                    "P2P sẵn sàng • " + peer.host() + ":" + peer.port(),
+                    online ? "P2P sẵn sàng • " + peer.host() + ":" + peer.port()
+                            : "Ngoại tuyến • Lịch sử chat",
                     new Font("Segoe UI", Font.PLAIN, 12), UiTheme.MUTED);
             text.add(nameLabel);
             text.add(Box.createVerticalStrut(2));

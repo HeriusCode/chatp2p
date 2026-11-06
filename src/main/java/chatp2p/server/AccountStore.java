@@ -4,14 +4,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 
@@ -22,38 +22,55 @@ final class AccountStore {
     private static final int HASH_BITS = 256;
     private static final int SALT_BYTES = 16;
 
-    private final Map<String, Credential> credentials = new HashMap<>();
     private final SecureRandom random = new SecureRandom();
     private final Path storePath;
+    private final PostgresDatabase database;
 
-    AccountStore() throws IOException {
+    AccountStore(PostgresDatabase database) throws IOException {
+        this.database = database;
         String configuredPath = System.getProperty("chatp2p.usersFile");
         storePath = configuredPath == null || configuredPath.isBlank()
                 ? DEFAULT_STORE_PATH : Path.of(configuredPath);
-        load();
+        importLegacyAccounts();
     }
 
     synchronized RegistrationResult register(String username, char[] password) throws IOException {
         validateUsername(username);
         validatePassword(password);
-        if (credentials.containsKey(username)) {
-            return RegistrationResult.USERNAME_EXISTS;
-        }
         byte[] salt = new byte[SALT_BYTES];
         random.nextBytes(salt);
         byte[] hash = derive(password, salt, ITERATIONS);
-        credentials.put(username, new Credential(ITERATIONS, salt, hash));
-        persist();
-        return RegistrationResult.CREATED;
+        try (Connection connection = database.open(); PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO accounts(username, iterations, salt, password_hash) "
+                        + "VALUES (?, ?, ?, ?) ON CONFLICT(username) DO NOTHING")) {
+            insert.setString(1, username);
+            insert.setInt(2, ITERATIONS);
+            insert.setBytes(3, salt);
+            insert.setBytes(4, hash);
+            return insert.executeUpdate() == 1
+                    ? RegistrationResult.CREATED : RegistrationResult.USERNAME_EXISTS;
+        } catch (SQLException failure) {
+            throw new IOException("Cannot register account in PostgreSQL", failure);
+        }
     }
 
-    synchronized boolean authenticate(String username, char[] password) {
-        Credential credential = credentials.get(username);
-        if (credential == null || password == null) {
+    synchronized boolean authenticate(String username, char[] password) throws IOException {
+        if (password == null) {
             return false;
         }
-        byte[] actual = derive(password, credential.salt, credential.iterations);
-        return MessageDigest.isEqual(credential.hash, actual);
+        try (Connection connection = database.open(); PreparedStatement select = connection.prepareStatement(
+                "SELECT iterations, salt, password_hash FROM accounts WHERE username=?")) {
+            select.setString(1, username);
+            try (ResultSet row = select.executeQuery()) {
+                if (!row.next()) {
+                    return false;
+                }
+                byte[] actual = derive(password, row.getBytes("salt"), row.getInt("iterations"));
+                return MessageDigest.isEqual(row.getBytes("password_hash"), actual);
+            }
+        } catch (SQLException failure) {
+            throw new IOException("Cannot authenticate account in PostgreSQL", failure);
+        }
     }
 
     static void validateUsername(String username) {
@@ -69,47 +86,33 @@ final class AccountStore {
         }
     }
 
-    private void load() throws IOException {
+    private void importLegacyAccounts() throws IOException {
         if (!Files.exists(storePath)) {
             return;
         }
-        for (String line : Files.readAllLines(storePath, StandardCharsets.UTF_8)) {
-            if (line.isBlank()) {
-                continue;
+        String sql = "INSERT INTO accounts(username, iterations, salt, password_hash) "
+                + "VALUES (?, ?, ?, ?) ON CONFLICT(username) DO NOTHING";
+        try (Connection connection = database.open(); PreparedStatement insert = connection.prepareStatement(sql)) {
+            for (String line : Files.readAllLines(storePath, StandardCharsets.UTF_8)) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                String[] fields = line.split("\\|", -1);
+                if (fields.length != 4) {
+                    throw new IOException("Invalid account record in " + storePath);
+                }
+                try {
+                    insert.setString(1, fields[0]);
+                    insert.setInt(2, Integer.parseInt(fields[1]));
+                    insert.setBytes(3, Base64.getDecoder().decode(fields[2]));
+                    insert.setBytes(4, Base64.getDecoder().decode(fields[3]));
+                    insert.executeUpdate();
+                } catch (IllegalArgumentException invalidRecord) {
+                    throw new IOException("Invalid account record for " + fields[0], invalidRecord);
+                }
             }
-            String[] fields = line.split("\\|", -1);
-            if (fields.length != 4) {
-                throw new IOException("Invalid account record in " + storePath);
-            }
-            try {
-                credentials.put(fields[0], new Credential(
-                        Integer.parseInt(fields[1]),
-                        Base64.getDecoder().decode(fields[2]),
-                        Base64.getDecoder().decode(fields[3])));
-            } catch (IllegalArgumentException invalidRecord) {
-                throw new IOException("Invalid account record for " + fields[0], invalidRecord);
-            }
-        }
-    }
-
-    private void persist() throws IOException {
-        Path parent = storePath.toAbsolutePath().getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
-        }
-        Path temporary = storePath.resolveSibling(storePath.getFileName() + ".tmp");
-        List<String> lines = credentials.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
-                .map(entry -> entry.getKey() + "|" + entry.getValue().iterations + "|"
-                        + Base64.getEncoder().encodeToString(entry.getValue().salt) + "|"
-                        + Base64.getEncoder().encodeToString(entry.getValue().hash))
-                .toList();
-        Files.write(temporary, lines, StandardCharsets.UTF_8);
-        try {
-            Files.move(temporary, storePath,
-                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
-            Files.move(temporary, storePath, StandardCopyOption.REPLACE_EXISTING);
+        } catch (SQLException failure) {
+            throw new IOException("Cannot import data/users.dat into PostgreSQL", failure);
         }
     }
 
@@ -130,6 +133,4 @@ final class AccountStore {
         USERNAME_EXISTS
     }
 
-    private record Credential(int iterations, byte[] salt, byte[] hash) {
-    }
 }

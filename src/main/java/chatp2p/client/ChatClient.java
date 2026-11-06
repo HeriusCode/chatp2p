@@ -39,10 +39,18 @@ public final class ChatClient implements AutoCloseable {
                 thread.setDaemon(true);
                 return thread;
             });
+    private final java.util.concurrent.ExecutorService historyExecutor =
+            Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "history-postgres-sync");
+                thread.setDaemon(true);
+                return thread;
+            });
     private volatile ServerConnection connection;
     private volatile PeerServer peerServer;
     private volatile FileTransferManager fileTransferManager;
     private volatile MulticastGroupChannel multicastChannel;
+    private volatile ChatHistoryStore historyStore;
+    private volatile HistorySync historySync;
     private final ConcurrentHashMap<UUID, Boolean> seenGroupMessages = new ConcurrentHashMap<>();
     private volatile List<PeerInfo> onlineUsers = List.of();
     private volatile List<GroupInfo> groups = List.of();
@@ -94,6 +102,8 @@ public final class ChatClient implements AutoCloseable {
                     .build();
             ProtocolMessage response = newConnection.request(login, REQUEST_TIMEOUT);
             requireType(response, MessageType.LOGIN_ACK);
+            historyStore = new ChatHistoryStore(requestedClientName, host, port);
+            historySync = new HistorySync(historyStore, newConnection);
             clientName = requestedClientName;
             state.set(ConnectionState.CONNECTED);
             try {
@@ -116,6 +126,8 @@ public final class ChatClient implements AutoCloseable {
             connection = null;
             peerServer = null;
             fileTransferManager = null;
+            historyStore = null;
+            historySync = null;
             state.set(ConnectionState.DISCONNECTED);
             throw failure;
         } finally {
@@ -159,6 +171,7 @@ public final class ChatClient implements AutoCloseable {
                 UUID.randomUUID(), clientName, receiver, normalizedMessage, Instant.now());
         PeerInfo peer = resolvePeer(receiver);
         PeerConnection.sendChat(peer, message);
+        saveHistory(store -> store.save(message));
         return message;
     }
 
@@ -170,7 +183,9 @@ public final class ChatClient implements AutoCloseable {
         if (manager == null) {
             throw new IOException("File transfer manager is not running");
         }
-        return manager.send(peer, file);
+        TransferHandle transfer = manager.send(peer, file);
+        saveHistory(store -> store.saveFileSource(transfer.fileInfo(), file));
+        return transfer;
     }
 
     public void refreshUsers() throws IOException {
@@ -223,6 +238,7 @@ public final class ChatClient implements AutoCloseable {
                         .field("timestamp", message.timestamp().toString())
                         .build(), REQUEST_TIMEOUT);
         requireType(response, MessageType.GROUP_CHAT);
+        saveHistory(store -> store.save(message));
         seenGroupMessages.put(message.messageId(), Boolean.TRUE);
         MulticastGroupChannel channel = multicastChannel;
         if (channel != null) {
@@ -241,6 +257,26 @@ public final class ChatClient implements AutoCloseable {
 
     public List<GroupInfo> groups() {
         return groups;
+    }
+
+    public ChatHistoryStore.Snapshot loadHistory() throws IOException {
+        ChatHistoryStore store = historyStore;
+        HistorySync sync = historySync;
+        if (sync != null) {
+            sync.uploadLocal();
+            sync.downloadRemote();
+        }
+        return store == null
+                ? new ChatHistoryStore.Snapshot(List.of(), List.of(), List.of())
+                : store.load();
+    }
+
+    public void rememberFailedFile(FileInfo file, Path source, String reason) {
+        saveHistory(store -> store.saveFileAttempt(file, source, reason));
+    }
+
+    public void rememberDownloadedFile(UUID fileId, Path target) {
+        saveHistory(store -> store.saveDownloadedPath(fileId, target));
     }
 
     public void addEventListener(ClientEventListener listener) {
@@ -303,11 +339,14 @@ public final class ChatClient implements AutoCloseable {
         peerServer = null;
         fileTransferManager = null;
         multicastChannel = null;
+        historyStore = null;
+        historySync = null;
         seenGroupMessages.clear();
         onlineUsers = List.of();
         groups = List.of();
         state.set(ConnectionState.DISCONNECTED);
         heartbeatExecutor.shutdownNow();
+        historyExecutor.shutdown();
     }
 
     private void handleServerEvent(ProtocolMessage message) {
@@ -347,6 +386,7 @@ public final class ChatClient implements AutoCloseable {
             seenGroupMessages.clear();
             seenGroupMessages.put(message.messageId(), Boolean.TRUE);
         }
+        saveHistory(store -> store.save(message));
         for (ClientEventListener listener : listeners) {
             listener.onGroupChatReceived(message);
         }
@@ -456,6 +496,7 @@ public final class ChatClient implements AutoCloseable {
         if (message == null) {
             return;
         }
+        saveHistory(store -> store.save(message));
         for (ClientEventListener listener : listeners) {
             listener.onChatReceived(message);
         }
@@ -483,6 +524,7 @@ public final class ChatClient implements AutoCloseable {
         return new FileTransferManager.Callbacks() {
             @Override
             public boolean offer(FileInfo file) {
+                saveHistory(store -> store.saveFileOffer(file));
                 for (ClientEventListener listener : listeners) {
                     if (listener.onFileOffered(file)) {
                         return true;
@@ -493,6 +535,7 @@ public final class ChatClient implements AutoCloseable {
 
             @Override
             public void progress(TransferProgress progress) {
+                saveHistory(store -> store.saveFileProgress(progress));
                 for (ClientEventListener listener : listeners) {
                     listener.onTransferProgress(progress);
                 }
@@ -500,6 +543,7 @@ public final class ChatClient implements AutoCloseable {
 
             @Override
             public void completed(FileInfo file, Path savedPath) {
+                saveHistory(store -> store.saveFileCompleted(file, savedPath));
                 for (ClientEventListener listener : listeners) {
                     listener.onTransferCompleted(file, savedPath);
                 }
@@ -507,11 +551,39 @@ public final class ChatClient implements AutoCloseable {
 
             @Override
             public void failed(FileInfo file, String reason) {
+                saveHistory(store -> store.saveFileFailed(file, reason));
                 for (ClientEventListener listener : listeners) {
                     listener.onTransferFailed(file, reason);
                 }
             }
         };
+    }
+
+    private void saveHistory(HistoryOperation operation) {
+        ChatHistoryStore store = historyStore;
+        if (store == null) {
+            return;
+        }
+        try {
+            operation.save(store);
+            HistorySync sync = historySync;
+            if (sync != null) {
+                historyExecutor.execute(() -> {
+                    try {
+                        sync.uploadLocal();
+                    } catch (IOException failure) {
+                        notifyConnectionError("Không thể đồng bộ lịch sử: " + failure.getMessage());
+                    }
+                });
+            }
+        } catch (IOException failure) {
+            notifyConnectionError(failure.getMessage());
+        }
+    }
+
+    @FunctionalInterface
+    private interface HistoryOperation {
+        void save(ChatHistoryStore store) throws IOException;
     }
 
     private void ensureConnected() throws IOException {

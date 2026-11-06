@@ -1,146 +1,50 @@
-# ChatP2P - TCP Control + P2P Chat/File
+# Chat P2P
 
-Ứng dụng chat theo kiến trúc **hybrid Client-Server + P2P**. Central Server quản lý
-tài khoản, đăng nhập, danh sách online, nhóm chat và peer discovery; chat riêng và
-file được truyền trực tiếp giữa hai client qua TCP. Chat nhóm được server phân phối
-đến các thành viên online vì một tin nhắn có nhiều người nhận.
+Ứng dụng Java 17 dùng Swing. Server quản lý tài khoản, trạng thái online, nhóm và lịch sử chat trong PostgreSQL. Tin nhắn riêng, file, ảnh, audio và video vẫn truyền trực tiếp giữa hai client qua TCP P2P. Chat nhóm dùng server làm đường truyền dự phòng khi UDP Multicast không hoạt động.
 
-Đã có `REGISTER/LOGIN`, `PING/PONG`, danh sách online, `CONNECT_REQUEST/PEER_INFO`,
-chat 1-1 P2P, gửi/nhận file, thu-phát Audio WAV, truyền Video, tiến trình,
-Cancel, SHA-256, `JOIN_GROUP`,
-`LEAVE_GROUP` và `GROUP_CHAT`. Mật khẩu được lưu tại `data/users.dat` bằng
-PBKDF2-HMAC-SHA256 với salt riêng; không lưu mật khẩu thuần.
+## Chuẩn bị PostgreSQL
 
-Ứng dụng còn sử dụng UDP đúng mục đích môn Mạng:
+1. Khởi động PostgreSQL trên máy chạy server và tạo database `chatp2p`.
+2. Tạo `data/db.properties` trên máy server (file này được Git bỏ qua):
 
-- **UDP Broadcast `5050`:** trang đăng nhập/đăng ký có nút `TÌM SERVER TRONG LAN`.
-- **UDP Multicast `239.255.42.99:5051`:** phát tin nhắn nhóm trong LAN; Central
-  Server vẫn xác thực membership và làm fallback khi Wi-Fi chặn multicast.
-- Client khử trùng tin nhắn theo UUID nên một tin multicast + fallback chỉ hiện một lần.
+   ```properties
+   url=jdbc:postgresql://localhost:5432/chatp2p
+   user=postgres
+   password=<mật khẩu PostgreSQL của bạn>
+   ```
 
-## 1. Quyết định kiến trúc
+   Có thể dùng `data/db.properties.example` làm mẫu. Biến môi trường `CHATP2P_DB_URL`, `CHATP2P_DB_USER` và `CHATP2P_DB_PASSWORD` ghi đè file cấu hình. Client trên máy khác chỉ cần IP và port của Chat Server, không cần kết nối PostgreSQL.
 
-Project dùng layered architecture, tách theo package:
+3. Server tự tạo các bảng `accounts` và `chat_history` khi khởi động. Nếu có `data/users.dat`, các tài khoản cũ được nhập vào PostgreSQL theo hash PBKDF2 hiện có. Cache SQLite trên máy server cũng được nhập. Các file cũ không bị xóa.
 
-```text
-ChatP2P/
-|-- pom.xml
-|-- scripts/
-|   |-- build.ps1
-|   |-- run-server.ps1
-|   `-- run-client.ps1
-|-- src/
-|   |-- main/java/chatp2p/
-|   |   |-- server/
-|   |   |-- client/
-|   |   |-- protocol/
-|   |   `-- view/
-|   `-- test/java/chatp2p/
-|-- data/
-|   |-- chat_history/
-|   |-- received_files/
-|   `-- logs/
-`-- docs/
-    `-- architecture.md
-```
-
-Cấu trúc nguồn được điều chỉnh sang convention Maven (`src/main/java`) thay vì
-đặt file Java trực tiếp dưới thư mục gốc. Tên package và trách nhiệm lớp vẫn bám
-yêu cầu; cách này giúp Java IDE, `javac` và Maven build nhất quán. Dữ liệu runtime
-nằm trong `data/`; server log được ghi tại `data/logs/server.log`.
-
-## 2. Yêu cầu môi trường
-
-- JDK 17 trở lên (cần cả `java` và `javac` trong `PATH`).
-- PowerShell 5.1 trở lên để dùng các script đi kèm.
-- Maven là tùy chọn, project không dùng thư viện ngoài.
-
-## 3. Build và chạy
-
-Build bằng JDK thuần:
+## Chạy ứng dụng
 
 ```powershell
 .\scripts\build.ps1
-```
-
-Chạy dashboard Swing của server:
-
-```powershell
 .\scripts\run-server.ps1
-```
-
-Trên dashboard, nhập port rồi nhấn `Khởi động Server`. Dashboard hiển thị số
-kết nối, danh sách socket/client và log sự kiện theo thời gian thực.
-
-Chạy server ở chế độ console khi cần:
-
-```powershell
-.\scripts\run-server.ps1 -Console -Port 5000
-```
-
-Chạy giao diện Swing client ở terminal khác:
-
-```powershell
 .\scripts\run-client.ps1
 ```
 
-Khi demo qua nhiều máy, chạy PowerShell bằng quyền Administrator trên mỗi máy:
+Chế độ console:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\allow-chat-p2p-firewall.ps1
+.\scripts\run-server.ps1 -Console -Port 5000
+.\scripts\run-client.ps1 -Console -HostName 192.168.1.10 -Port 5000 `
+    -ClientName client-a -Password <mật-khẩu-ứng-dụng>
 ```
 
-Script mở TCP `5000-5010`, UDP `5050-5051` và cho phép `java.exe` nhận kết nối
-P2P trên cổng động. Chạy script bằng quyền Administrator trên từng máy; không cần
-tắt toàn bộ Firewall.
+Để hai máy chat trực tiếp, cho phép cổng TCP của server và cổng P2P động của client qua firewall. Script `scripts/allow-chat-p2p-firewall.ps1` tạo các quy tắc cần thiết trên Windows. UDP Broadcast tìm server LAN và UDP Multicast hỗ trợ nhóm.
 
-Ứng dụng có hai trang xác thực riêng:
+## Lịch sử
 
-- `LoginFrame`: nhập Server Host, Server Port, tên đăng nhập và mật khẩu.
-- `RegisterFrame`: tạo tài khoản mới, có trường xác nhận mật khẩu và nút quay lại.
+Client lưu một cache SQLite tại `data/chat_history/chat.db`. Khi đăng nhập, client nhập lịch sử cũ từ cache lên PostgreSQL rồi tải lịch sử theo tài khoản về cache. Các sự kiện mới được đồng bộ nền. Bản ghi gồm chat riêng, chat nhóm và metadata file; nội dung file và media không được lưu trong database. Nếu client đóng trước khi đồng bộ xong, cache sẽ thử gửi lại ở lần đăng nhập tiếp theo. Để nhập cache cũ, hãy đăng nhập cùng địa chỉ và port server mà cache đã dùng.
 
-Từ trang đăng nhập, chọn `TẠO TÀI KHOẢN` để mở trang đăng ký; đăng ký thành công
-sẽ tự quay về trang đăng nhập và giữ lại Server/username. Trong màn hình chính:
+Thông tin tài khoản và nội dung chat trong PostgreSQL do server quản lý. Mỗi client chỉ được tải lịch sử của tài khoản đã đăng nhập. Thông tin đường dẫn file cục bộ chỉ hữu ích trên máy đã nhận file; file cần được truyền lại nếu máy khác muốn có byte của file đó.
 
-- Tab `NGƯỜI DÙNG`: chọn người online để chat riêng, gửi file, thu/gửi/phát Audio
-  WAV và gửi Video P2P. Ảnh được tải thumbnail bất đồng bộ và hiển thị trực tiếp
-  trong hội thoại; video có preview Play và mở bằng trình phát mặc định.
-- Tab `NHÓM`: nhập tên nhóm rồi nhấn `JOIN`; chọn nhóm đã tham gia để chat và dùng
-  `RỜI NHÓM` khi muốn thoát. JOIN tự tạo nhóm nếu tên đó chưa tồn tại.
-
-File nhận được lưu tại `data/received_files/` và tự đổi tên nếu tên đã tồn tại.
-Audio được thu bằng Java Sound ở PCM mono 16 kHz. Bản hiện tại truyền video dạng
-file trực tiếp; chưa triển khai cuộc gọi video thời gian thực vì Java SE không cung
-cấp sẵn webcam/codec.
-
-Chế độ console vẫn được giữ để kiểm tra nhanh hoặc chạy trên máy không có GUI:
-
-```powershell
-.\scripts\run-client.ps1 -Console -HostName localhost -Port 5000 `
-    -ClientName client-a -Password chatp2p123
-```
-
-Build bằng Maven nếu đã cài Maven:
-
-```powershell
-mvn test
-```
-
-## 4. Kiểm thử Phase 1
-
-Smoke test tự khởi động server trên một cổng trống, kết nối client, thực hiện
-handshake và `PING/PONG`, sau đó đóng sạch tài nguyên:
+## Kiểm thử
 
 ```powershell
 .\scripts\build.ps1 -RunTests
 ```
 
-Kiểm thử thủ công:
-
-1. Chạy server và thấy log `Server started`.
-2. Chạy ít nhất hai client ở hai terminal khác nhau.
-3. Mỗi client nhận `HELLO_ACK` và có thể chạy `ping`.
-4. Gõ `quit`; server phải ghi nhận client disconnect mà không dừng server.
-5. Đóng đột ngột một client; server vẫn tiếp tục nhận client khác.
-
-Chi tiết luồng, protocol và diagram nằm trong [docs/architecture.md](docs/architecture.md).
+Kiểm thử dùng một PostgreSQL schema riêng, tạo và xóa trong database cấu hình. Nó kiểm tra đăng nhập, nhập tài khoản cũ, P2P chat/file, nhóm, và tải lịch sử lại bằng cache mới. Xem [kiến trúc](docs/architecture.md) để biết luồng dữ liệu.

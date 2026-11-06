@@ -6,6 +6,7 @@ build/
 .vscode/
 *.iml
 data/users.dat
+data/db.properties
 data/chat_history/*
 data/received_files/*
 data/logs/*

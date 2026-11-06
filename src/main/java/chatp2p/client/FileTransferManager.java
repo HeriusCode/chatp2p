@@ -192,6 +192,11 @@ final class FileTransferManager implements AutoCloseable {
         }
 
         @Override
+        public FileInfo fileInfo() {
+            return info;
+        }
+
+        @Override
         public void cancel() {
             cancelled.set(true);
             Socket current = socket;

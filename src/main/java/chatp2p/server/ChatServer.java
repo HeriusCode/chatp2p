@@ -28,6 +28,7 @@ public final class ChatServer implements AutoCloseable {
     private final ServerEventListener eventListener;
     private final UserManager userManager;
     private final AccountStore accountStore;
+    private final PostgresDatabase database;
     private final GroupManager groupManager;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong connectionIds = new AtomicLong();
@@ -67,9 +68,14 @@ public final class ChatServer implements AutoCloseable {
         this.eventListener = Objects.requireNonNull(eventListener, "eventListener");
         this.userManager = new UserManager(logger);
         try {
-            this.accountStore = new AccountStore();
+            this.database = new PostgresDatabase();
+            this.accountStore = new AccountStore(database);
+            int imported = LegacyHistoryImporter.importLocal(database);
+            if (imported > 0) {
+                logger.info("Imported " + imported + " local history records into PostgreSQL");
+            }
         } catch (IOException failure) {
-            throw new IllegalStateException("Cannot load data/users.dat", failure);
+            throw new IllegalStateException("Cannot initialize PostgreSQL", failure);
         }
         this.groupManager = new GroupManager(userManager, logger);
     }
@@ -117,7 +123,7 @@ public final class ChatServer implements AutoCloseable {
                         try {
                             new ClientHandler(
                                     connectionId, clientSocket, logger, eventListener,
-                                    userManager, accountStore, groupManager).run();
+                                    userManager, accountStore, groupManager, database).run();
                         } finally {
                             activeSockets.remove(clientSocket);
                         }

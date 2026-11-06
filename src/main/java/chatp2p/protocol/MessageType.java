@@ -28,7 +28,11 @@ public enum MessageType {
     GROUP_LIST(22),
     JOIN_GROUP(23),
     LEAVE_GROUP(24),
-    GROUP_CHAT(25);
+    GROUP_CHAT(25),
+    HISTORY_PUT(26),
+    HISTORY_ACK(27),
+    HISTORY_GET(28),
+    HISTORY_PAGE(29);
 
     private final int wireCode;
 

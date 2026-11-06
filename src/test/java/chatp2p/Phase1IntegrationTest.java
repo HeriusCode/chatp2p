@@ -1,6 +1,7 @@
 package chatp2p;
 
 import chatp2p.client.ChatClient;
+import chatp2p.client.ChatHistoryStore;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
 import chatp2p.client.LanServerDiscovery;
@@ -19,7 +20,18 @@ import java.net.DatagramSocket;
 import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.Base64;
+import java.util.Properties;
+import java.util.UUID;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -35,9 +47,37 @@ public final class Phase1IntegrationTest {
     }
 
     public static void main(String[] args) throws Exception {
+        Properties databaseConfig = new Properties();
+        try (var input = Files.newInputStream(Path.of("data", "db.properties"))) {
+            databaseConfig.load(input);
+        }
+        String schema = "chatp2p_test_" + UUID.randomUUID().toString().replace("-", "");
+        String baseUrl = databaseConfig.getProperty("url");
+        Properties login = new Properties();
+        login.setProperty("user", databaseConfig.getProperty("user"));
+        login.setProperty("password", databaseConfig.getProperty("password"));
+        try (Connection database = DriverManager.getConnection(baseUrl, login);
+             Statement setup = database.createStatement()) {
+            setup.execute("CREATE SCHEMA " + schema);
+        }
+        System.setProperty("chatp2p.db.url", baseUrl + "?currentSchema=" + schema);
         Path accountFile = Files.createTempFile("chatp2p-test-users-", ".dat");
         Files.deleteIfExists(accountFile);
+        byte[] salt = new byte[16];
+        new SecureRandom().nextBytes(salt);
+        byte[] hash = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                .generateSecret(new PBEKeySpec(TEST_PASSWORD.toCharArray(), salt, 120_000, 256))
+                .getEncoded();
+        Files.writeString(accountFile, "legacy-user|120000|"
+                + Base64.getEncoder().encodeToString(salt) + "|"
+                + Base64.getEncoder().encodeToString(hash) + System.lineSeparator(),
+                StandardCharsets.UTF_8);
         System.setProperty("chatp2p.usersFile", accountFile.toString());
+        Path historyFile = Files.createTempFile("chatp2p-test-history-", ".db");
+        Files.deleteIfExists(historyFile);
+        System.setProperty("chatp2p.historyFile", historyFile.toString());
+        Path remoteHistoryFile = Files.createTempFile("chatp2p-test-remote-", ".db");
+        Files.deleteIfExists(remoteHistoryFile);
         try (DatagramSocket availablePort = new DatagramSocket(0)) {
             System.setProperty(
                     "chatp2p.discoveryPort", Integer.toString(availablePort.getLocalPort()));
@@ -62,6 +102,11 @@ public final class Phase1IntegrationTest {
             registerIfMissing(server.boundPort(), "phase1-b");
             registerIfMissing(server.boundPort(), "abrupt-client");
             registerIfMissing(server.boundPort(), "after-abort");
+            try (ChatClient legacy = new ChatClient()) {
+                legacy.connect("127.0.0.1", server.boundPort(), "legacy-user", TEST_PASSWORD);
+                check(legacy.state() == ConnectionState.CONNECTED,
+                        "legacy account was not imported into PostgreSQL");
+            }
             expectIOException(
                     () -> ChatClient.registerAccount(
                             "127.0.0.1", server.boundPort(), "phase1-a", TEST_PASSWORD),
@@ -100,6 +145,12 @@ public final class Phase1IntegrationTest {
 
                 testFileTransfer(first, second);
                 testGroupChat(first, second);
+                check(first.loadHistory().directMessages().stream()
+                        .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                        "sender history was not synchronized");
+                check(second.loadHistory().directMessages().stream()
+                        .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                        "receiver history was not synchronized");
 
                 abortClientConnection(server.boundPort());
                 try (ChatClient afterAbort = new ChatClient()) {
@@ -110,16 +161,69 @@ public final class Phase1IntegrationTest {
                     check(!afterAbort.ping().isNegative(), "post-abort ping duration is invalid");
                 }
             }
+            ChatHistoryStore firstHistory = new ChatHistoryStore(
+                    "phase1-a", "127.0.0.1", server.boundPort(), historyFile);
+            ChatHistoryStore secondHistory = new ChatHistoryStore(
+                    "phase1-b", "127.0.0.1", server.boundPort(), historyFile);
+            check(firstHistory.load().directMessages().stream()
+                    .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                    "sender P2P history did not survive restart");
+            check(secondHistory.load().directMessages().stream()
+                    .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                    "receiver P2P history did not survive restart");
+            check(firstHistory.load().groupMessages().stream()
+                    .anyMatch(message -> message.content().equals("hello-group")),
+                    "group history did not survive restart");
+            check(secondHistory.load().groupMessages().stream()
+                    .filter(message -> message.content().equals("hello-group")).count() == 1,
+                    "receiver group history was missing or duplicated");
+            check(secondHistory.load().files().size() == 1,
+                    "receiver file history did not survive restart");
+            check(new ChatHistoryStore("another-account", "127.0.0.1",
+                    server.boundPort(), historyFile).load().directMessages().isEmpty(),
+                    "history was visible to another account");
+            System.setProperty("chatp2p.historyFile", remoteHistoryFile.toString());
+            try (ChatClient restored = new ChatClient()) {
+                restored.connect("127.0.0.1", server.boundPort(), "phase1-b", TEST_PASSWORD);
+                ChatHistoryStore.Snapshot recovered = restored.loadHistory();
+                check(recovered.directMessages().stream()
+                        .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                        "PostgreSQL direct history was not restored on another cache");
+                check(recovered.groupMessages().stream()
+                        .anyMatch(message -> message.content().equals("hello-group")),
+                        "PostgreSQL group history was not restored on another cache");
+                check(!recovered.files().isEmpty(),
+                        "PostgreSQL file metadata was not restored on another cache");
+            }
+            try (Connection database = DriverManager.getConnection(
+                    baseUrl + "?currentSchema=" + schema, login);
+                 Statement query = database.createStatement();
+                 ResultSet accounts = query.executeQuery("SELECT count(*) FROM accounts")) {
+                check(accounts.next() && accounts.getInt(1) >= 5,
+                        "accounts were not stored in PostgreSQL");
+            }
             System.out.println("PASS: auth, UDP Broadcast discovery, P2P chat/file, "
-                    + "UDP Multicast group send with server fallback, and shutdown");
+                    + "UDP Multicast group send, PostgreSQL accounts/history, and shutdown");
         } finally {
             server.close();
             serverThread.shutdown();
             serverThread.awaitTermination(5, TimeUnit.SECONDS);
             serverResult.get(5, TimeUnit.SECONDS);
             Files.deleteIfExists(accountFile);
+            Files.deleteIfExists(historyFile);
+            Files.deleteIfExists(Path.of(historyFile + "-wal"));
+            Files.deleteIfExists(Path.of(historyFile + "-shm"));
+            Files.deleteIfExists(remoteHistoryFile);
+            Files.deleteIfExists(Path.of(remoteHistoryFile + "-wal"));
+            Files.deleteIfExists(Path.of(remoteHistoryFile + "-shm"));
             System.clearProperty("chatp2p.usersFile");
+            System.clearProperty("chatp2p.historyFile");
             System.clearProperty("chatp2p.discoveryPort");
+            System.clearProperty("chatp2p.db.url");
+            try (Connection database = DriverManager.getConnection(baseUrl, login);
+                 Statement cleanup = database.createStatement()) {
+                cleanup.execute("DROP SCHEMA " + schema + " CASCADE");
+            }
         }
     }
 

@@ -351,7 +351,7 @@ final class AuthView {
 
             // Bottom: Tech stack info
             JLabel footer = UiTheme.label(
-                    "Pure Java 17 • Zero Dependencies",
+                    "Java 17 • PostgreSQL chat history",
                     new Font("Segoe UI", Font.PLAIN, 11), new Color(148, 163, 184));
             footer.setAlignmentX(Component.LEFT_ALIGNMENT);
 

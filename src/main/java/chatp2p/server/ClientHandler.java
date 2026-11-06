@@ -29,6 +29,7 @@ final class ClientHandler implements Runnable {
     private final UserManager userManager;
     private final AccountStore accountStore;
     private final GroupManager groupManager;
+    private final PostgresDatabase database;
     private final String remoteAddress;
     private String clientName;
     private boolean authenticated;
@@ -41,7 +42,8 @@ final class ClientHandler implements Runnable {
             ServerEventListener eventListener,
             UserManager userManager,
             AccountStore accountStore,
-            GroupManager groupManager) {
+            GroupManager groupManager,
+            PostgresDatabase database) {
         this.connectionId = connectionId;
         this.socket = socket;
         this.logger = logger;
@@ -49,6 +51,7 @@ final class ClientHandler implements Runnable {
         this.userManager = userManager;
         this.accountStore = accountStore;
         this.groupManager = groupManager;
+        this.database = database;
         this.remoteAddress = socket.getRemoteSocketAddress().toString();
     }
 
@@ -143,9 +146,27 @@ final class ClientHandler implements Runnable {
                 handleGroupChat(message, output);
                 yield true;
             }
+            case HISTORY_PUT -> {
+                try {
+                    database.putHistory(clientName, message);
+                    send(ProtocolMessage.responseTo(message, MessageType.HISTORY_ACK).build());
+                } catch (IOException | IllegalArgumentException invalid) {
+                    sendError(output, message, "HISTORY_ERROR", invalid.getMessage());
+                }
+                yield true;
+            }
+            case HISTORY_GET -> {
+                try {
+                    send(database.historyPage(clientName, message));
+                } catch (IOException invalid) {
+                    sendError(output, message, "HISTORY_ERROR", invalid.getMessage());
+                }
+                yield true;
+            }
             case HELLO, HELLO_ACK, REGISTER, REGISTER_ACK, LOGIN, LOGIN_ACK,
                     PONG, ERROR, USER_LIST, PEER_INFO, CHAT, GROUP_LIST,
-                    FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL -> {
+                    FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL,
+                    HISTORY_ACK, HISTORY_PAGE -> {
                 sendError(output, message, "UNEXPECTED_MESSAGE",
                         "Server cannot accept " + message.type() + " from a client");
                 yield true;

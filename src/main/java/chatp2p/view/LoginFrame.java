@@ -1,6 +1,7 @@
 package chatp2p.view;
 
 import chatp2p.client.ChatClient;
+import chatp2p.client.ChatHistoryStore;
 import chatp2p.client.LanServerDiscovery;
 
 import java.awt.Dimension;
@@ -30,6 +31,7 @@ public final class LoginFrame extends JFrame {
     private final JLabel statusLabel = new JLabel(" ");
     private final JProgressBar progressBar = new JProgressBar();
     private volatile ChatClient connectingClient;
+    private volatile ChatHistoryStore.Snapshot loadedHistory;
     private volatile SwingWorker<ChatClient, Void> worker;
 
     public LoginFrame() {
@@ -120,6 +122,7 @@ public final class LoginFrame extends JFrame {
             @Override
             protected ChatClient doInBackground() throws Exception {
                 attempt.connect(host, port, username, password);
+                loadedHistory = attempt.loadHistory();
                 return attempt;
             }
 
@@ -134,7 +137,7 @@ public final class LoginFrame extends JFrame {
                     ChatClient client = get();
                     connectingClient = null;
                     dispose();
-                    new MainFrame(client).setVisible(true);
+                    new MainFrame(client, loadedHistory).setVisible(true);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     attempt.close();
