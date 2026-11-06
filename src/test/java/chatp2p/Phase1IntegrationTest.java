@@ -145,6 +145,16 @@ public final class Phase1IntegrationTest {
 
                 testFileTransfer(first, second);
                 testGroupChat(first, second);
+                expectIOException(() -> first.createGroup(
+                                "phase1-invalid", java.util.List.of("no-such-account")),
+                        "unknown invitee was accepted");
+                first.createGroup("phase1-persisted",
+                        java.util.List.of("phase1-b", "legacy-user"));
+                waitUntil(() -> second.groups().stream().anyMatch(group ->
+                                group.name().equals("phase1-persisted")
+                                        && group.joined() && group.memberCount() == 3),
+                        "invited user did not see the new group");
+                first.sendGroupChat("phase1-persisted", "offline-group-history");
                 check(first.loadHistory().directMessages().stream()
                         .anyMatch(message -> message.content().equals("direct-p2p-test")),
                         "sender history was not synchronized");
@@ -195,6 +205,35 @@ public final class Phase1IntegrationTest {
                 check(!recovered.files().isEmpty(),
                         "PostgreSQL file metadata was not restored on another cache");
             }
+            ChatServer reloadedServer = new ChatServer(0);
+            ExecutorService reloadedThread = Executors.newSingleThreadExecutor();
+            Future<?> reloadedResult = reloadedThread.submit(() -> {
+                try {
+                    reloadedServer.start();
+                } catch (java.io.IOException failure) {
+                    throw new RuntimeException(failure);
+                }
+            });
+            try {
+                reloadedServer.awaitStarted(Duration.ofSeconds(5));
+                try (ChatClient invited = new ChatClient()) {
+                    invited.connect("127.0.0.1", reloadedServer.boundPort(),
+                            "legacy-user", TEST_PASSWORD);
+                    check(invited.groups().stream().anyMatch(group ->
+                                    group.name().equals("phase1-persisted")
+                                            && group.joined() && group.memberCount() == 3),
+                            "group membership was not restored from PostgreSQL");
+                    check(invited.loadHistory().groupMessages().stream().anyMatch(message ->
+                                    message.groupName().equals("phase1-persisted")
+                                            && message.content().equals("offline-group-history")),
+                            "offline invitee did not receive saved group history");
+                }
+            } finally {
+                reloadedServer.close();
+                reloadedThread.shutdown();
+                reloadedThread.awaitTermination(5, TimeUnit.SECONDS);
+                reloadedResult.get(5, TimeUnit.SECONDS);
+            }
             try (Connection database = DriverManager.getConnection(
                     baseUrl + "?currentSchema=" + schema, login);
                  Statement query = database.createStatement();
@@ -202,8 +241,16 @@ public final class Phase1IntegrationTest {
                 check(accounts.next() && accounts.getInt(1) >= 5,
                         "accounts were not stored in PostgreSQL");
             }
+            try (Connection database = DriverManager.getConnection(
+                    baseUrl + "?currentSchema=" + schema, login);
+                 Statement query = database.createStatement();
+                 ResultSet invalidGroup = query.executeQuery(
+                         "SELECT count(*) FROM chat_groups WHERE name='phase1-invalid'")) {
+                check(invalidGroup.next() && invalidGroup.getInt(1) == 0,
+                        "failed invitation left a partial group in PostgreSQL");
+            }
             System.out.println("PASS: auth, UDP Broadcast discovery, P2P chat/file, "
-                    + "UDP Multicast group send, PostgreSQL accounts/history, and shutdown");
+                    + "UDP Multicast group send, PostgreSQL accounts/groups/history, and shutdown");
         } finally {
             server.close();
             serverThread.shutdown();
@@ -268,8 +315,10 @@ public final class Phase1IntegrationTest {
 
     private static void testGroupChat(ChatClient sender, ChatClient receiver) throws Exception {
         String group = "phase1-room";
-        sender.joinGroup(group);
-        receiver.joinGroup(group);
+        sender.createGroup(group, java.util.List.of(receiver.clientName()));
+        waitUntil(() -> receiver.groups().stream()
+                .anyMatch(item -> item.name().equals(group) && item.joined()),
+                "invited receiver did not join the group");
         CountDownLatch delivered = new CountDownLatch(1);
         receiver.addEventListener(new ClientEventListener() {
             @Override

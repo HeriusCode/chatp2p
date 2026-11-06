@@ -13,44 +13,67 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
-/** Thread-safe in-memory group membership and group-message distribution. */
+/** Group membership cached in memory and persisted in PostgreSQL. */
 final class GroupManager {
     private final ConcurrentHashMap<String, Set<String>> groups = new ConcurrentHashMap<>();
     private final UserManager users;
     private final Logger logger;
+    private final PostgresDatabase database;
 
-    GroupManager(UserManager users, Logger logger) {
+    GroupManager(UserManager users, Logger logger, PostgresDatabase database) throws IOException {
         this.users = users;
         this.logger = logger;
+        this.database = database;
+        database.loadGroups().forEach((name, members) -> {
+            Set<String> copy = ConcurrentHashMap.newKeySet();
+            copy.addAll(members);
+            groups.put(name, copy);
+        });
     }
 
-    boolean join(String username, String groupName) {
+    synchronized boolean create(String creator, String groupName, List<String> invitees)
+            throws IOException {
         validateGroupName(groupName);
-        return groups.computeIfAbsent(groupName, ignored -> ConcurrentHashMap.newKeySet())
-                .add(username);
-    }
-
-    boolean leave(String username, String groupName) {
-        Set<String> members = groups.get(groupName);
-        if (members == null || !members.remove(username)) {
+        if (invitees == null || invitees.size() > 50) {
+            throw new IllegalArgumentException("Chỉ được mời tối đa 50 tài khoản");
+        }
+        for (String username : invitees) {
+            AccountStore.validateUsername(username);
+        }
+        if (!database.createGroup(creator, groupName, invitees)) {
             return false;
         }
-        if (members.isEmpty()) {
-            groups.remove(groupName, members);
+        Set<String> members = ConcurrentHashMap.newKeySet();
+        members.add(creator);
+        members.addAll(invitees);
+        groups.put(groupName, members);
+        return true;
+    }
+
+    synchronized boolean join(String username, String groupName) throws IOException {
+        validateGroupName(groupName);
+        Set<String> members = groups.get(groupName);
+        if (members == null) {
+            throw new IOException("Nhóm không tồn tại. Hãy dùng Tạo nhóm trước.");
         }
+        database.joinGroup(username, groupName);
+        return members.add(username);
+    }
+
+    synchronized boolean leave(String username, String groupName) throws IOException {
+        Set<String> members = groups.get(groupName);
+        if (members == null || !members.contains(username)) {
+            return false;
+        }
+        if (!database.leaveGroup(username, groupName)) {
+            return false;
+        }
+        members.remove(username);
         return true;
     }
 
     void removeUser(String username) {
-        if (username == null) {
-            return;
-        }
-        groups.forEach((name, members) -> {
-            members.remove(username);
-            if (members.isEmpty()) {
-                groups.remove(name, members);
-            }
-        });
+        // Logging out does not revoke persistent group membership.
     }
 
     boolean isMember(String username, String groupName) {
@@ -71,6 +94,7 @@ final class GroupManager {
         if (members == null || !members.contains(message.sender())) {
             throw new IOException("Bạn chưa tham gia nhóm " + message.groupName());
         }
+        database.saveGroupMessage(message, Set.copyOf(members));
         ProtocolMessage delivery = ProtocolMessage.builder(MessageType.GROUP_CHAT)
                 .field("messageId", message.messageId().toString())
                 .field("groupName", message.groupName())

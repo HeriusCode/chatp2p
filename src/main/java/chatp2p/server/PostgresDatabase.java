@@ -1,5 +1,6 @@
 package chatp2p.server;
 
+import chatp2p.model.GroupMessage;
 import chatp2p.protocol.MessageType;
 import chatp2p.protocol.ProtocolMessage;
 
@@ -13,7 +14,13 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 
 /** Server-only PostgreSQL connection and persistent chat archive. */
@@ -56,6 +63,19 @@ final class PostgresDatabase {
                     """);
             schema.execute("CREATE INDEX IF NOT EXISTS history_by_owner "
                     + "ON chat_history(owner, sent_at, event_id)");
+            schema.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_groups (
+                      name TEXT PRIMARY KEY,
+                      creator TEXT NOT NULL REFERENCES accounts(username),
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now())
+                    """);
+            schema.execute("""
+                    CREATE TABLE IF NOT EXISTS group_members (
+                      group_name TEXT NOT NULL REFERENCES chat_groups(name),
+                      username TEXT NOT NULL REFERENCES accounts(username),
+                      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                      PRIMARY KEY(group_name, username))
+                    """);
         } catch (SQLException failure) {
             throw new IOException("Cannot connect to PostgreSQL: " + failure.getMessage(), failure);
         }
@@ -63,6 +83,118 @@ final class PostgresDatabase {
 
     Connection open() throws SQLException {
         return DriverManager.getConnection(url, credentials);
+    }
+
+    Map<String, Set<String>> loadGroups() throws IOException {
+        Map<String, Set<String>> groups = new HashMap<>();
+        try (Connection connection = open(); Statement query = connection.createStatement();
+             ResultSet rows = query.executeQuery("SELECT g.name, m.username FROM chat_groups g "
+                     + "LEFT JOIN group_members m ON m.group_name = g.name")) {
+            while (rows.next()) {
+                Set<String> members = groups.computeIfAbsent(rows.getString(1),
+                        ignored -> new HashSet<>());
+                if (rows.getString(2) != null) {
+                    members.add(rows.getString(2));
+                }
+            }
+        } catch (SQLException failure) {
+            throw new IOException("Cannot load groups from PostgreSQL", failure);
+        }
+        return groups;
+    }
+
+    boolean createGroup(String creator, String groupName, List<String> invitees) throws IOException {
+        Set<String> members = new LinkedHashSet<>(invitees);
+        members.add(creator);
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement account = connection.prepareStatement(
+                         "SELECT 1 FROM accounts WHERE username=?");
+                 PreparedStatement group = connection.prepareStatement(
+                         "INSERT INTO chat_groups(name, creator) VALUES (?, ?) "
+                                 + "ON CONFLICT(name) DO NOTHING");
+                 PreparedStatement member = connection.prepareStatement(
+                         "INSERT INTO group_members(group_name, username) VALUES (?, ?)")) {
+                group.setString(1, groupName);
+                group.setString(2, creator);
+                if (group.executeUpdate() == 0) {
+                    connection.rollback();
+                    return false;
+                }
+                for (String username : members) {
+                    account.setString(1, username);
+                    try (ResultSet found = account.executeQuery()) {
+                        if (!found.next()) {
+                            connection.rollback();
+                            throw new IOException("Tài khoản " + username + " không tồn tại");
+                        }
+                    }
+                    member.setString(1, groupName);
+                    member.setString(2, username);
+                    member.executeUpdate();
+                }
+                connection.commit();
+                return true;
+            } catch (SQLException | IOException failure) {
+                connection.rollback();
+                if (failure instanceof IOException io) {
+                    throw io;
+                }
+                throw new IOException("Cannot create group in PostgreSQL", failure);
+            }
+        } catch (SQLException failure) {
+            throw new IOException("Cannot create group in PostgreSQL", failure);
+        }
+    }
+
+    void joinGroup(String username, String groupName) throws IOException {
+        try (Connection connection = open(); PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO group_members(group_name, username) VALUES (?, ?) "
+                        + "ON CONFLICT(group_name, username) DO NOTHING")) {
+            insert.setString(1, groupName);
+            insert.setString(2, username);
+            insert.executeUpdate();
+        } catch (SQLException failure) {
+            throw new IOException("Cannot join group in PostgreSQL", failure);
+        }
+    }
+
+    boolean leaveGroup(String username, String groupName) throws IOException {
+        try (Connection connection = open(); PreparedStatement delete = connection.prepareStatement(
+                "DELETE FROM group_members WHERE group_name=? AND username=?")) {
+            delete.setString(1, groupName);
+            delete.setString(2, username);
+            return delete.executeUpdate() == 1;
+        } catch (SQLException failure) {
+            throw new IOException("Cannot leave group in PostgreSQL", failure);
+        }
+    }
+
+    void saveGroupMessage(GroupMessage message, Set<String> members) throws IOException {
+        String sql = "INSERT INTO chat_history(owner, kind, event_id, sender, conversation, "
+                + "content, sent_at) VALUES (?, 'GROUP', ?, ?, ?, ?, ?) "
+                + "ON CONFLICT(owner, kind, event_id) DO NOTHING";
+        try (Connection connection = open()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement insert = connection.prepareStatement(sql)) {
+                for (String member : members) {
+                    insert.setString(1, member);
+                    insert.setObject(2, message.messageId());
+                    insert.setString(3, message.sender());
+                    insert.setString(4, message.groupName());
+                    insert.setString(5, message.content());
+                    insert.setLong(6, message.timestamp().toEpochMilli());
+                    insert.addBatch();
+                }
+                insert.executeBatch();
+                connection.commit();
+            } catch (SQLException failure) {
+                connection.rollback();
+                throw new IOException("Cannot save group chat in PostgreSQL", failure);
+            }
+        } catch (SQLException failure) {
+            throw new IOException("Cannot save group chat in PostgreSQL", failure);
+        }
     }
 
     void putHistory(String owner, ProtocolMessage request) throws IOException {

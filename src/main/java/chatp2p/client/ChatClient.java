@@ -55,6 +55,7 @@ public final class ChatClient implements AutoCloseable {
     private volatile List<PeerInfo> onlineUsers = List.of();
     private volatile List<GroupInfo> groups = List.of();
     private volatile String clientName;
+    private volatile boolean createGroupSupported;
     private volatile int peerPort;
 
     public void connect(String host, int port, String requestedClientName) throws IOException {
@@ -102,6 +103,7 @@ public final class ChatClient implements AutoCloseable {
                     .build();
             ProtocolMessage response = newConnection.request(login, REQUEST_TIMEOUT);
             requireType(response, MessageType.LOGIN_ACK);
+            createGroupSupported = Boolean.parseBoolean(response.field("createGroupSupported"));
             historyStore = new ChatHistoryStore(requestedClientName, host, port);
             historySync = new HistorySync(historyStore, newConnection);
             clientName = requestedClientName;
@@ -128,6 +130,7 @@ public final class ChatClient implements AutoCloseable {
             fileTransferManager = null;
             historyStore = null;
             historySync = null;
+            createGroupSupported = false;
             state.set(ConnectionState.DISCONNECTED);
             throw failure;
         } finally {
@@ -214,6 +217,36 @@ public final class ChatClient implements AutoCloseable {
         refreshGroups();
     }
 
+    public void createGroup(String groupName, List<String> invitedUsers) throws IOException {
+        ensureConnected();
+        if (!createGroupSupported) {
+            throw new IOException("Server đang chạy bản cũ. Hãy dừng và chạy lại ServerMain, "
+                    + "sau đó đăng nhập lại trước khi tạo nhóm.");
+        }
+        if (groupName == null || groupName.isBlank() || invitedUsers == null) {
+            throw new IllegalArgumentException("Tên nhóm và danh sách mời không hợp lệ");
+        }
+        java.util.LinkedHashSet<String> invitees = new java.util.LinkedHashSet<>();
+        for (String username : invitedUsers) {
+            if (username != null && !username.isBlank() && !username.trim().equals(clientName)) {
+                invitees.add(username.trim());
+            }
+        }
+        if (invitees.size() > 50) {
+            throw new IllegalArgumentException("Chỉ được mời tối đa 50 tài khoản");
+        }
+        ProtocolMessage.Builder request = ProtocolMessage.builder(MessageType.CREATE_GROUP)
+                .field("groupName", groupName.trim())
+                .field("inviteCount", Integer.toString(invitees.size()));
+        int index = 0;
+        for (String username : invitees) {
+            request.field("invite." + index++, username);
+        }
+        ProtocolMessage response = connection.request(request.build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.CREATE_GROUP_ACK);
+        refreshGroups();
+    }
+
     public void leaveGroup(String groupName) throws IOException {
         ensureConnected();
         ProtocolMessage response = connection.request(
@@ -257,6 +290,10 @@ public final class ChatClient implements AutoCloseable {
 
     public List<GroupInfo> groups() {
         return groups;
+    }
+
+    public boolean createGroupSupported() {
+        return createGroupSupported;
     }
 
     public ChatHistoryStore.Snapshot loadHistory() throws IOException {
@@ -341,6 +378,7 @@ public final class ChatClient implements AutoCloseable {
         multicastChannel = null;
         historyStore = null;
         historySync = null;
+        createGroupSupported = false;
         seenGroupMessages.clear();
         onlineUsers = List.of();
         groups = List.of();

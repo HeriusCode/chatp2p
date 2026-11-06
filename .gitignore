@@ -9,8 +9,10 @@ data/users.dat
 data/db.properties
 data/chat_history/*
 data/received_files/*
+data/captured_media/*
 data/logs/*
 !data/chat_history/.gitkeep
 !data/received_files/.gitkeep
+!data/captured_media/.gitkeep
 !data/logs/.gitkeep
 

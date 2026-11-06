@@ -32,7 +32,9 @@ public enum MessageType {
     HISTORY_PUT(26),
     HISTORY_ACK(27),
     HISTORY_GET(28),
-    HISTORY_PAGE(29);
+    HISTORY_PAGE(29),
+    CREATE_GROUP(30),
+    CREATE_GROUP_ACK(31);
 
     private final int wireCode;
 

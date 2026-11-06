@@ -74,10 +74,10 @@ public final class ChatServer implements AutoCloseable {
             if (imported > 0) {
                 logger.info("Imported " + imported + " local history records into PostgreSQL");
             }
+            this.groupManager = new GroupManager(userManager, logger, database);
         } catch (IOException failure) {
             throw new IllegalStateException("Cannot initialize PostgreSQL", failure);
         }
-        this.groupManager = new GroupManager(userManager, logger);
     }
 
     /** Binds the port and runs the accept loop until close() is called. */

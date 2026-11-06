@@ -113,6 +113,7 @@ public final class MainFrame extends JFrame {
     private final JPanel listContainer = new JPanel(listCardLayout);
     private final JTextField groupNameField = new JTextField();
     private final JButton joinGroupButton = new JButton("Tham gia");
+    private final JButton createGroupButton = new JButton("+ Tạo nhóm");
 
     // Chat Header components
     private final JPanel headerAvatarPanel = new JPanel() {
@@ -148,7 +149,7 @@ public final class MainFrame extends JFrame {
     private final ComposerIconButton audioButton =
             new ComposerIconButton(ComposerIcon.MICROPHONE, "Thu và gửi âm thanh");
     private final ComposerIconButton videoButton =
-            new ComposerIconButton(ComposerIcon.VIDEO, "Gửi video P2P");
+            new ComposerIconButton(ComposerIcon.VIDEO, "Chụp ảnh hoặc quay video trực tiếp");
     private final ComposerIconButton sendButton =
             new ComposerIconButton(ComposerIcon.SEND, "Gửi tin nhắn");
 
@@ -408,7 +409,7 @@ public final class MainFrame extends JFrame {
         groupNameField.setBorder(BorderFactory.createCompoundBorder(
                 new RoundedBorder(UiTheme.BORDER, 14),
                 BorderFactory.createEmptyBorder(6, 10, 6, 10)));
-        groupNameField.setToolTipText("Tên nhóm mới hoặc nhóm đã có");
+        groupNameField.setToolTipText("Tên nhóm đã có");
         joinGroupButton.setFont(new Font("Segoe UI", Font.BOLD, 12));
         joinGroupButton.setForeground(UiTheme.WHITE);
         joinGroupButton.setBackground(UiTheme.PRIMARY);
@@ -419,8 +420,20 @@ public final class MainFrame extends JFrame {
         joinPanel.add(groupNameField, BorderLayout.CENTER);
         joinPanel.add(joinGroupButton, BorderLayout.EAST);
 
+        createGroupButton.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        createGroupButton.setForeground(UiTheme.WHITE);
+        createGroupButton.setBackground(UiTheme.PRIMARY);
+        createGroupButton.setFocusPainted(false);
+        createGroupButton.setBorderPainted(false);
+        createGroupButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        createGroupButton.setPreferredSize(new Dimension(280, 38));
+        JPanel groupActions = UiTheme.panel(new BorderLayout(0, 4), UiTheme.WHITE);
+        groupActions.setBorder(BorderFactory.createEmptyBorder(0, 10, 8, 10));
+        groupActions.add(createGroupButton, BorderLayout.NORTH);
+        groupActions.add(joinPanel, BorderLayout.SOUTH);
+
         groupsPanel.add(groupScroll, BorderLayout.CENTER);
-        groupsPanel.add(joinPanel, BorderLayout.SOUTH);
+        groupsPanel.add(groupActions, BorderLayout.SOUTH);
 
         listContainer.add(userScroll, "USERS");
         listContainer.add(groupsPanel, "GROUPS");
@@ -607,6 +620,7 @@ public final class MainFrame extends JFrame {
         });
         joinGroupButton.addActionListener(event -> joinGroup());
         groupNameField.addActionListener(event -> joinGroup());
+        createGroupButton.addActionListener(event -> showCreateGroupDialog());
         leaveGroupButton.addActionListener(event -> leaveSelectedGroup());
         emojiButton.addActionListener(event -> showMediaPopover(emojiButton, ZaloMediaPopover.TabType.EMOJI));
         gifButton.addActionListener(event -> showMediaPopover(gifButton, ZaloMediaPopover.TabType.GIF));
@@ -620,7 +634,7 @@ public final class MainFrame extends JFrame {
         });
         fileButton.addActionListener(event -> chooseAndSendFile());
         audioButton.addActionListener(event -> toggleAudioRecording());
-        videoButton.addActionListener(event -> chooseAndSendVideo());
+        videoButton.addActionListener(event -> openCamera());
     }
 
     private void updateUsers(List<PeerInfo> users) {
@@ -770,6 +784,94 @@ public final class MainFrame extends JFrame {
         }.execute();
     }
 
+    private void showCreateGroupDialog() {
+        if (!client.createGroupSupported()) {
+            JOptionPane.showMessageDialog(this,
+                    "Server đang chạy bản cũ. Hãy dừng và chạy lại ServerMain, "
+                            + "sau đó đăng nhập lại trước khi tạo nhóm.",
+                    "Cần khởi động lại server", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        JTextField nameField = new JTextField(24);
+        nameField.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        DefaultListModel<String> candidates = new DefaultListModel<>();
+        rawUsers.stream().map(PeerInfo::username)
+                .filter(username -> !username.equals(client.clientName()))
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .forEach(candidates::addElement);
+        JList<String> inviteList = new JList<>(candidates);
+        inviteList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        inviteList.setVisibleRowCount(5);
+        JScrollPane inviteScroll = new JScrollPane(inviteList);
+        inviteScroll.setPreferredSize(new Dimension(320, 120));
+        JTextField otherUsers = new JTextField(24);
+        otherUsers.setToolTipText("Tên đăng nhập, ngăn cách bằng dấu phẩy");
+
+        JPanel form = UiTheme.panel(null, UiTheme.WHITE);
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+        form.add(UiTheme.label("Tên nhóm", UiTheme.BODY_BOLD, UiTheme.NAVY));
+        form.add(Box.createVerticalStrut(5));
+        form.add(nameField);
+        form.add(Box.createVerticalStrut(14));
+        form.add(UiTheme.label("Mời người đang online (chọn nhiều người)",
+                UiTheme.BODY_BOLD, UiTheme.NAVY));
+        form.add(Box.createVerticalStrut(5));
+        form.add(inviteScroll);
+        form.add(Box.createVerticalStrut(12));
+        form.add(UiTheme.label("Tài khoản khác, kể cả offline (cách nhau bằng dấu phẩy)",
+                new Font("Segoe UI", Font.PLAIN, 12), UiTheme.SLATE));
+        form.add(Box.createVerticalStrut(5));
+        form.add(otherUsers);
+
+        int choice = JOptionPane.showConfirmDialog(this, form, "Tạo nhóm mới",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+        String name = nameField.getText().trim();
+        List<String> invitees = new ArrayList<>(inviteList.getSelectedValuesList());
+        for (String username : otherUsers.getText().split(",")) {
+            if (!username.isBlank()) {
+                invitees.add(username.trim());
+            }
+        }
+        if (name.isBlank()) {
+            JOptionPane.showMessageDialog(this, "Hãy nhập tên nhóm.",
+                    "Tạo nhóm", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        createGroupButton.setEnabled(false);
+        new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                client.createGroup(name, invitees);
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                createGroupButton.setEnabled(true);
+                try {
+                    get();
+                    searchField.setText("");
+                    updateGroups(client.groups());
+                    client.groups().stream()
+                            .filter(group -> group.name().equals(name) && group.joined())
+                            .findFirst().ifPresent(group -> {
+                                groupList.setSelectedValue(group, true);
+                                selectGroup(group);
+                            });
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException failure) {
+                    JOptionPane.showMessageDialog(MainFrame.this,
+                            friendlyMessage(failure.getCause()), "Không thể tạo nhóm",
+                            JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        }.execute();
+    }
+
     private void leaveSelectedGroup() {
         GroupInfo group = selectedGroup;
         if (group == null) {
@@ -904,7 +1006,26 @@ public final class MainFrame extends JFrame {
         sendPath(peer, file, fileButton);
     }
 
-    private void chooseAndSendVideo() {
+    private void openCamera() {
+        PeerInfo peer = selectedPeer;
+        if (peer == null) {
+            return;
+        }
+        videoButton.setEnabled(false);
+        try {
+            new CameraCaptureDialog(this, peer.username(),
+                    file -> sendPath(peer, file, videoButton),
+                    this::chooseAndSendVideoFile,
+                    () -> videoButton.setEnabled(selectedPeer != null
+                            && client.state() == ConnectionState.CONNECTED))
+                    .setVisible(true);
+        } catch (LinkageError missingCameraLibrary) {
+            videoButton.setEnabled(true);
+            showError("Thiếu thư viện camera. Hãy chạy scripts/build.ps1 rồi mở lại client.");
+        }
+    }
+
+    private void chooseAndSendVideoFile() {
         PeerInfo peer = selectedPeer;
         if (peer == null) {
             return;

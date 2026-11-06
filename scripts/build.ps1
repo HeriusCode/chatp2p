@@ -14,6 +14,14 @@ $sqliteVersion = '3.54.1.0'
 $sqliteJar = Join-Path $dependencyOutput "sqlite-jdbc-$sqliteVersion.jar"
 $postgresVersion = '42.7.14'
 $postgresJar = Join-Path $dependencyOutput "postgresql-$postgresVersion.jar"
+$cameraDependencies = @(
+    @{ Group = 'com/github/sarxos'; Artifact = 'webcam-capture'; Version = '0.3.12' },
+    @{ Group = 'com/nativelibs4java'; Artifact = 'bridj'; Version = '0.7.0' },
+    @{ Group = 'org/slf4j'; Artifact = 'slf4j-api'; Version = '1.7.36' },
+    @{ Group = 'org/slf4j'; Artifact = 'slf4j-nop'; Version = '1.7.36' },
+    @{ Group = 'org/jcodec'; Artifact = 'jcodec'; Version = '0.2.5' },
+    @{ Group = 'org/jcodec'; Artifact = 'jcodec-javase'; Version = '0.2.5' }
+)
 
 function Reset-BuildDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -80,13 +88,40 @@ if (-not (Test-Path -LiteralPath $postgresJar)) {
         }
     }
 }
+foreach ($dependency in $cameraDependencies) {
+    $name = "$($dependency.Artifact)-$($dependency.Version).jar"
+    $jar = Join-Path $dependencyOutput $name
+    if (Test-Path -LiteralPath $jar) {
+        continue
+    }
+    $groupPath = $dependency.Group -replace '/', '\'
+    $cached = Join-Path $env:USERPROFILE ".m2\repository\$groupPath\$($dependency.Artifact)\$($dependency.Version)\$name"
+    if (Test-Path -LiteralPath $cached) {
+        Copy-Item -LiteralPath $cached -Destination $jar
+        continue
+    }
+    $download = "$jar.download"
+    $url = "https://repo.maven.apache.org/maven2/$($dependency.Group)/$($dependency.Artifact)/$($dependency.Version)/$name"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $download -UseBasicParsing
+        Move-Item -LiteralPath $download -Destination $jar
+    } catch {
+        if (Test-Path -LiteralPath $download) {
+            Remove-Item -LiteralPath $download -Force
+        }
+        throw "Cannot download $name from Maven Central: $_"
+    }
+}
+$cameraClasspath = ($cameraDependencies | ForEach-Object {
+    Join-Path $dependencyOutput "$($_.Artifact)-$($_.Version).jar"
+}) -join ';'
 $mainSources = @(Get-ChildItem -LiteralPath $sourceRoot -Filter '*.java' -Recurse |
     ForEach-Object { $_.FullName })
 if ($mainSources.Count -eq 0) {
     throw 'No Java source files were found.'
 }
 
-& javac --release 17 -encoding UTF-8 -d $mainOutput $mainSources
+& javac --release 17 -encoding UTF-8 -cp $cameraClasspath -d $mainOutput $mainSources
 if ($LASTEXITCODE -ne 0) {
     throw 'Main source compilation failed.'
 }
@@ -96,13 +131,13 @@ if ($RunTests) {
     New-Item -ItemType Directory -Force -Path $testOutput | Out-Null
     $testSources = @(Get-ChildItem -LiteralPath $testRoot -Filter '*.java' -Recurse |
         ForEach-Object { $_.FullName })
-    & javac --release 17 -encoding UTF-8 -cp "$mainOutput;$sqliteJar;$postgresJar" -d $testOutput $testSources
+    & javac --release 17 -encoding UTF-8 -cp "$mainOutput;$sqliteJar;$postgresJar;$cameraClasspath" -d $testOutput $testSources
     if ($LASTEXITCODE -ne 0) {
         throw 'Test source compilation failed.'
     }
     Push-Location $projectRoot
     try {
-        & java -ea -cp "$mainOutput;$testOutput;$sqliteJar;$postgresJar" chatp2p.Phase1IntegrationTest
+        & java -ea -cp "$mainOutput;$testOutput;$sqliteJar;$postgresJar;$cameraClasspath" chatp2p.Phase1IntegrationTest
         if ($LASTEXITCODE -ne 0) {
             throw 'Phase 1 integration test failed.'
         }

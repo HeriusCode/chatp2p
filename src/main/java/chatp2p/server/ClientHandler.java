@@ -16,6 +16,8 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -138,6 +140,10 @@ final class ClientHandler implements Runnable {
                 handleJoinGroup(message);
                 yield true;
             }
+            case CREATE_GROUP -> {
+                handleCreateGroup(message);
+                yield true;
+            }
             case LEAVE_GROUP -> {
                 handleLeaveGroup(message);
                 yield true;
@@ -166,7 +172,7 @@ final class ClientHandler implements Runnable {
             case HELLO, HELLO_ACK, REGISTER, REGISTER_ACK, LOGIN, LOGIN_ACK,
                     PONG, ERROR, USER_LIST, PEER_INFO, CHAT, GROUP_LIST,
                     FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL,
-                    HISTORY_ACK, HISTORY_PAGE -> {
+                    HISTORY_ACK, HISTORY_PAGE, CREATE_GROUP_ACK -> {
                 sendError(output, message, "UNEXPECTED_MESSAGE",
                         "Server cannot accept " + message.type() + " from a client");
                 yield true;
@@ -236,6 +242,7 @@ final class ClientHandler implements Runnable {
         ProtocolMessage response = ProtocolMessage.responseTo(message, MessageType.LOGIN_ACK)
                 .field("message", "Đăng nhập thành công")
                 .field("remoteAddress", socket.getRemoteSocketAddress().toString())
+                .field("createGroupSupported", "true")
                 .build();
         send(response);
         logger.info(label() + " logged in");
@@ -249,7 +256,7 @@ final class ClientHandler implements Runnable {
         String groupName = request.requiredField("groupName").trim();
         try {
             groupManager.join(clientName, groupName);
-        } catch (IllegalArgumentException invalidName) {
+        } catch (IllegalArgumentException | IOException invalidName) {
             sendError(output(), request, "INVALID_GROUP", invalidName.getMessage());
             return;
         }
@@ -261,9 +268,44 @@ final class ClientHandler implements Runnable {
         groupManager.broadcastLists();
     }
 
+    private void handleCreateGroup(ProtocolMessage request) throws IOException {
+        try {
+            String name = request.requiredField("groupName").trim();
+            int count = Integer.parseInt(request.requiredField("inviteCount"));
+            if (count < 0 || count > 50) {
+                throw new IllegalArgumentException("Chỉ được mời tối đa 50 tài khoản");
+            }
+            List<String> invitees = new ArrayList<>();
+            for (int index = 0; index < count; index++) {
+                String username = request.requiredField("invite." + index).trim();
+                if (!username.equals(clientName)) {
+                    invitees.add(username);
+                }
+            }
+            if (!groupManager.create(clientName, name, invitees)) {
+                sendError(output(), request, "GROUP_EXISTS", "Tên nhóm đã tồn tại");
+                return;
+            }
+            send(ProtocolMessage.responseTo(request, MessageType.CREATE_GROUP_ACK)
+                    .field("groupName", name).build());
+            logger.info(clientName + " created group " + name + " with "
+                    + invitees.size() + " invitations");
+            groupManager.broadcastLists();
+        } catch (IllegalArgumentException | IOException invalid) {
+            sendError(output(), request, "INVALID_GROUP", invalid.getMessage());
+        }
+    }
+
     private void handleLeaveGroup(ProtocolMessage request) throws IOException {
         String groupName = request.requiredField("groupName").trim();
-        if (!groupManager.leave(clientName, groupName)) {
+        boolean left;
+        try {
+            left = groupManager.leave(clientName, groupName);
+        } catch (IOException failure) {
+            sendError(output(), request, "GROUP_ERROR", failure.getMessage());
+            return;
+        }
+        if (!left) {
             sendError(output(), request, "NOT_A_MEMBER", "Bạn chưa tham gia nhóm " + groupName);
             return;
         }
@@ -292,10 +334,14 @@ final class ClientHandler implements Runnable {
             sendError(output, request, "SENDER_MISMATCH", "Người gửi không khớp phiên đăng nhập");
             return;
         }
+        if (!groupManager.isMember(clientName, groupMessage.groupName())) {
+            sendError(output, request, "NOT_A_MEMBER", "Bạn chưa tham gia nhóm");
+            return;
+        }
         try {
             groupManager.deliver(groupMessage);
-        } catch (IOException notMember) {
-            sendError(output, request, "NOT_A_MEMBER", notMember.getMessage());
+        } catch (IOException failure) {
+            sendError(output, request, "GROUP_ERROR", failure.getMessage());
             return;
         }
         send(ProtocolMessage.responseTo(request, MessageType.GROUP_CHAT)

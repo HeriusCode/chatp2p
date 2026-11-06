@@ -4,6 +4,10 @@ import chatp2p.view.LoginFrame;
 
 import java.awt.GraphicsEnvironment;
 import java.io.IOException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Scanner;
@@ -11,11 +15,16 @@ import javax.swing.SwingUtilities;
 
 /** Starts the Swing client by default, or the console client when arguments are supplied. */
 public final class ClientMain {
+    private static URLClassLoader cameraClassLoader;
+
     private ClientMain() {
     }
 
     public static void main(String[] args) {
         if (args.length == 0) {
+            if (!cameraLibrariesAvailable() && launchWithBundledLibraries(args)) {
+                return;
+            }
             launchGraphicalClient();
             return;
         }
@@ -26,6 +35,47 @@ public final class ClientMain {
         }
 
         runConsoleClient(args);
+    }
+
+    private static boolean cameraLibrariesAvailable() {
+        try {
+            Class.forName("com.github.sarxos.webcam.Webcam");
+            Class.forName("org.jcodec.api.awt.AWTSequenceEncoder");
+            return true;
+        } catch (ClassNotFoundException | LinkageError missing) {
+            return false;
+        }
+    }
+
+    /** Keeps the IDE's plain target/classes launch working after scripts/build.ps1. */
+    private static boolean launchWithBundledLibraries(String[] args) {
+        try {
+            Path classes = Path.of(ClientMain.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI());
+            Path dependencies = classes.getParent().resolve("dependency");
+            String[] jars = {
+                "sqlite-jdbc-3.54.1.0.jar", "webcam-capture-0.3.12.jar",
+                "bridj-0.7.0.jar", "slf4j-api-1.7.36.jar", "slf4j-nop-1.7.36.jar",
+                "jcodec-0.2.5.jar", "jcodec-javase-0.2.5.jar"
+            };
+            URL[] urls = new URL[jars.length + 1];
+            urls[0] = classes.toUri().toURL();
+            for (int index = 0; index < jars.length; index++) {
+                Path jar = dependencies.resolve(jars[index]);
+                if (!Files.isRegularFile(jar)) {
+                    return false;
+                }
+                urls[index + 1] = jar.toUri().toURL();
+            }
+            cameraClassLoader = new URLClassLoader(urls, ClassLoader.getPlatformClassLoader());
+            Thread.currentThread().setContextClassLoader(cameraClassLoader);
+            Class<?> entry = Class.forName(ClientMain.class.getName(), true, cameraClassLoader);
+            entry.getMethod("main", String[].class).invoke(null, (Object) args);
+            return true;
+        } catch (Exception failure) {
+            System.err.println("Cannot load camera libraries: " + failure.getMessage());
+            return false;
+        }
     }
 
     private static void launchGraphicalClient() {
