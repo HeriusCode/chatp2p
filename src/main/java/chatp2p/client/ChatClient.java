@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.nio.file.Path;
+import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -48,6 +49,7 @@ public final class ChatClient implements AutoCloseable {
     private volatile ServerConnection connection;
     private volatile PeerServer peerServer;
     private volatile FileTransferManager fileTransferManager;
+    private volatile CallManager callManager;
     private volatile MulticastGroupChannel multicastChannel;
     private volatile ChatHistoryStore historyStore;
     private volatile HistorySync historySync;
@@ -83,14 +85,28 @@ public final class ChatClient implements AutoCloseable {
 
         FileTransferManager newFileManager = new FileTransferManager(
                 requestedClientName, createFileCallbacks());
+        CallManager newCallManager = new CallManager(requestedClientName,
+                new CallSession.Listener() {
+                    public void changed(CallSession call) {
+                        for (ClientEventListener listener : listeners) listener.onCallChanged(call);
+                    }
+                    public void videoFrame(CallSession call, BufferedImage frame, boolean local) {
+                        for (ClientEventListener listener : listeners) {
+                            listener.onCallVideoFrame(call, frame, local);
+                        }
+                    }
+                    public void ended(CallSession call) { }
+                });
         PeerServer newPeerServer = new PeerServer(
                 requestedClientName,
                 this::notifyChatReceived,
                 newFileManager,
+                newCallManager,
                 this::notifyConnectionError);
         ServerConnection newConnection = new ServerConnection();
         peerServer = newPeerServer;
         fileTransferManager = newFileManager;
+        callManager = newCallManager;
         connection = newConnection;
         try {
             peerPort = newPeerServer.start(requestedPeerPort);
@@ -125,9 +141,11 @@ public final class ChatClient implements AutoCloseable {
             newConnection.close();
             newPeerServer.close();
             newFileManager.close();
+            newCallManager.close();
             connection = null;
             peerServer = null;
             fileTransferManager = null;
+            callManager = null;
             historyStore = null;
             historySync = null;
             createGroupSupported = false;
@@ -189,6 +207,47 @@ public final class ChatClient implements AutoCloseable {
         TransferHandle transfer = manager.send(peer, file);
         saveHistory(store -> store.saveFileSource(transfer.fileInfo(), file));
         return transfer;
+    }
+
+    public List<TransferHandle> sendGroupFile(String groupName, Path file) throws IOException {
+        ensureConnected();
+        Objects.requireNonNull(file, "file");
+        ProtocolMessage response = connection.request(
+                ProtocolMessage.builder(MessageType.GET_GROUP_MEMBERS)
+                        .field("groupName", groupName).build(), REQUEST_TIMEOUT);
+        requireType(response, MessageType.GROUP_MEMBERS);
+        int count;
+        try {
+            count = Integer.parseInt(response.requiredField("count"));
+        } catch (NumberFormatException invalid) {
+            throw new IOException("Invalid group member count", invalid);
+        }
+        if (count < 0 || count > 50) {
+            throw new IOException("Invalid group member count");
+        }
+        List<TransferHandle> transfers = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            String prefix = "user." + i;
+            PeerInfo peer;
+            try {
+                peer = new PeerInfo(response.requiredField(prefix + ".name"),
+                        response.requiredField(prefix + ".host"),
+                        Integer.parseInt(response.requiredField(prefix + ".port")));
+            } catch (NumberFormatException invalid) {
+                throw new IOException("Invalid peer port", invalid);
+            }
+            TransferHandle transfer = fileTransferManager.send(peer, file, groupName);
+            transfers.add(transfer);
+            saveHistory(store -> store.saveFileSource(transfer.fileInfo(), file));
+        }
+        return List.copyOf(transfers);
+    }
+
+    public CallSession startCall(String receiver, boolean video) throws IOException {
+        ensureConnected();
+        CallManager manager = callManager;
+        if (manager == null) throw new IOException("Kênh gọi điện chưa sẵn sàng");
+        return manager.start(resolvePeer(receiver), video);
     }
 
     public void refreshUsers() throws IOException {
@@ -368,6 +427,8 @@ public final class ChatClient implements AutoCloseable {
         if (currentFileManager != null) {
             currentFileManager.close();
         }
+        CallManager currentCalls = callManager;
+        if (currentCalls != null) currentCalls.close();
         MulticastGroupChannel currentMulticast = multicastChannel;
         if (currentMulticast != null) {
             currentMulticast.close();
@@ -375,6 +436,7 @@ public final class ChatClient implements AutoCloseable {
         connection = null;
         peerServer = null;
         fileTransferManager = null;
+        callManager = null;
         multicastChannel = null;
         historyStore = null;
         historySync = null;
@@ -562,6 +624,10 @@ public final class ChatClient implements AutoCloseable {
         return new FileTransferManager.Callbacks() {
             @Override
             public boolean offer(FileInfo file) {
+                if (file.groupName() != null && groups.stream().noneMatch(group ->
+                        group.name().equals(file.groupName()) && group.joined())) {
+                    return false;
+                }
                 saveHistory(store -> store.saveFileOffer(file));
                 for (ClientEventListener listener : listeners) {
                     if (listener.onFileOffered(file)) {

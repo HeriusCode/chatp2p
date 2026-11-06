@@ -30,8 +30,8 @@ public final class ChatHistoryStore {
     private static final String FILE_UPSERT = """
             INSERT INTO files(owner, server, file_id, file_name, file_size, sender, receiver,
                               direction, state, transferred, created_at, source_path, saved_path,
-                              downloaded_path, failure_reason)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              downloaded_path, failure_reason, group_name)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner, server, file_id) DO UPDATE SET
                 state = CASE WHEN files.state IN ('SUCCESS', 'FAILED', 'CANCELLED')
                                   AND excluded.state = 'WAITING'
@@ -42,6 +42,7 @@ public final class ChatHistoryStore {
                 saved_path = COALESCE(excluded.saved_path, files.saved_path),
                 downloaded_path = COALESCE(excluded.downloaded_path, files.downloaded_path),
                 failure_reason = COALESCE(excluded.failure_reason, files.failure_reason)
+                ,group_name = COALESCE(excluded.group_name, files.group_name)
             """;
 
     public record StoredFile(FileInfo file, TransferDirection direction, TransferState state,
@@ -96,11 +97,19 @@ public final class ChatHistoryStore {
                             direction TEXT NOT NULL, state TEXT NOT NULL,
                             transferred INTEGER NOT NULL, created_at INTEGER NOT NULL,
                             source_path TEXT, saved_path TEXT, downloaded_path TEXT,
-                            failure_reason TEXT,
+                            failure_reason TEXT, group_name TEXT,
                             PRIMARY KEY(owner, server, file_id))
                         """);
                 schema.execute("CREATE INDEX IF NOT EXISTS files_by_chat "
                         + "ON files(owner, server, sender, receiver, created_at)");
+                try {
+                    schema.execute("ALTER TABLE files ADD COLUMN group_name TEXT");
+                } catch (SQLException alreadyPresent) {
+                    if (!alreadyPresent.getMessage().toLowerCase(Locale.ROOT)
+                            .contains("duplicate column")) {
+                        throw alreadyPresent;
+                    }
+                }
             }
         } catch (SQLException failure) {
             throw new IOException("Không thể mở database lịch sử chat: " + failure.getMessage(), failure);
@@ -223,6 +232,7 @@ public final class ChatHistoryStore {
             insert.setString(13, pathText(saved));
             insert.setString(14, pathText(downloaded));
             insert.setString(15, failureReason);
+            insert.setString(16, file.groupName());
             insert.executeUpdate();
         } catch (SQLException failure) {
             throw databaseError(failure);
@@ -257,7 +267,8 @@ public final class ChatHistoryStore {
                 while (rows.next()) {
                     FileInfo file = new FileInfo(UUID.fromString(rows.getString("file_id")),
                             rows.getString("file_name"), rows.getLong("file_size"),
-                            rows.getString("sender"), rows.getString("receiver"));
+                            rows.getString("sender"), rows.getString("receiver"),
+                            rows.getString("group_name"));
                     TransferState state = TransferState.valueOf(rows.getString("state"));
                     String reason = rows.getString("failure_reason");
                     if (state == TransferState.WAITING || state == TransferState.TRANSFERRING) {

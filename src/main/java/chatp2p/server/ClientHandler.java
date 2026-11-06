@@ -136,6 +136,14 @@ final class ClientHandler implements Runnable {
                 send(groupManager.buildList(message, clientName));
                 yield true;
             }
+            case GET_GROUP_MEMBERS -> {
+                try {
+                    send(groupManager.onlineMembers(message, clientName));
+                } catch (IOException invalid) {
+                    sendError(output, message, "INVALID_GROUP", invalid.getMessage());
+                }
+                yield true;
+            }
             case JOIN_GROUP -> {
                 handleJoinGroup(message);
                 yield true;
@@ -172,7 +180,8 @@ final class ClientHandler implements Runnable {
             case HELLO, HELLO_ACK, REGISTER, REGISTER_ACK, LOGIN, LOGIN_ACK,
                     PONG, ERROR, USER_LIST, PEER_INFO, CHAT, GROUP_LIST,
                     FILE_REQUEST, FILE_ACCEPT, FILE_REJECT, FILE_END, FILE_CANCEL,
-                    HISTORY_ACK, HISTORY_PAGE, CREATE_GROUP_ACK -> {
+                    HISTORY_ACK, HISTORY_PAGE, CREATE_GROUP_ACK, GROUP_MEMBERS,
+                    CALL_INVITE, CALL_ACCEPT, CALL_REJECT -> {
                 sendError(output, message, "UNEXPECTED_MESSAGE",
                         "Server cannot accept " + message.type() + " from a client");
                 yield true;

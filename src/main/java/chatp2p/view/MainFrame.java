@@ -2,6 +2,7 @@ package chatp2p.view;
 
 import chatp2p.client.AudioRecorder;
 import chatp2p.client.ChatClient;
+import chatp2p.client.CallSession;
 import chatp2p.client.ChatHistoryStore;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
@@ -135,6 +136,8 @@ public final class MainFrame extends JFrame {
     private final JLabel chatTitle = new JLabel("Chọn một cuộc trò chuyện");
     private final JLabel chatSubtitle = new JLabel("Kết nối trực tiếp qua P2P TCP");
     private final JButton leaveGroupButton = new JButton("Rời nhóm");
+    private final JButton voiceCallButton = new JButton("Gọi thoại", CallIcons.PHONE);
+    private final JButton videoCallButton = new JButton("Gọi video", CallIcons.VIDEO);
 
     // Chat Area components
     private final JPanel messagesPanel = new JPanel();
@@ -156,6 +159,7 @@ public final class MainFrame extends JFrame {
     // History tracking
     private final Map<String, List<ConversationEntry>> histories = new HashMap<>();
     private final Map<String, List<GroupMessage>> groupHistories = new HashMap<>();
+    private final Map<String, List<FileEntry>> groupFiles = new HashMap<>();
     private final Set<String> historyPeers = new HashSet<>();
     private final Set<UUID> displayedMessageIds = new HashSet<>();
     private final Set<UUID> displayedGroupIds = new HashSet<>();
@@ -163,6 +167,7 @@ public final class MainFrame extends JFrame {
     private final Map<UUID, TransferHandle> outgoingTransfers = new HashMap<>();
     private final Map<UUID, Path> outgoingSourcePaths = new HashMap<>();
     private final Map<UUID, Clip> playingAudio = new HashMap<>();
+    private final Map<CallSession, CallFrame> callFrames = new HashMap<>();
     private final Map<Path, ImageIcon> imageThumbnails = new HashMap<>();
     private final Set<Path> loadingThumbnails = new HashSet<>();
     private final Set<Path> failedThumbnails = new HashSet<>();
@@ -172,6 +177,7 @@ public final class MainFrame extends JFrame {
     private volatile PeerInfo selectedPeer;
     private volatile GroupInfo selectedGroup;
     private volatile PeerInfo audioRecordingPeer;
+    private volatile String audioRecordingGroup;
 
     private final ClientEventListener eventListener = new ClientEventListener() {
         @Override
@@ -226,6 +232,28 @@ public final class MainFrame extends JFrame {
         @Override
         public void onConnectionError(String message) {
             SwingUtilities.invokeLater(() -> showError(message));
+        }
+
+        @Override
+        public void onCallChanged(CallSession call) {
+            SwingUtilities.invokeLater(() -> {
+                CallFrame frame = callFrames.get(call);
+                if (frame == null) {
+                    frame = new CallFrame(call);
+                    callFrames.put(call, frame);
+                    frame.setLocationRelativeTo(MainFrame.this);
+                    frame.setVisible(true);
+                }
+                frame.updateState();
+            });
+        }
+
+        @Override
+        public void onCallVideoFrame(CallSession call, BufferedImage image, boolean local) {
+            SwingUtilities.invokeLater(() -> {
+                CallFrame frame = callFrames.get(call);
+                if (frame != null) frame.showFrame(image, local);
+            });
         }
     };
 
@@ -560,6 +588,16 @@ public final class MainFrame extends JFrame {
         leaveGroupButton.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         leaveGroupButton.setVisible(false);
         rightBox.add(leaveGroupButton);
+        for (JButton button : List.of(voiceCallButton, videoCallButton)) {
+            button.setFont(new Font("Segoe UI", Font.BOLD, 12));
+            button.setForeground(UiTheme.PRIMARY);
+            button.setBackground(new Color(239, 246, 255));
+            button.setIconTextGap(6);
+            button.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
+            button.setFocusPainted(false);
+            button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            rightBox.add(button);
+        }
 
         header.add(leftBox, BorderLayout.WEST);
         header.add(rightBox, BorderLayout.EAST);
@@ -635,6 +673,8 @@ public final class MainFrame extends JFrame {
         fileButton.addActionListener(event -> chooseAndSendFile());
         audioButton.addActionListener(event -> toggleAudioRecording());
         videoButton.addActionListener(event -> openCamera());
+        voiceCallButton.addActionListener(event -> startCall(false));
+        videoCallButton.addActionListener(event -> startCall(true));
     }
 
     private void updateUsers(List<PeerInfo> users) {
@@ -685,6 +725,24 @@ public final class MainFrame extends JFrame {
             }
         }
         renderHistory();
+    }
+
+    private void startCall(boolean video) {
+        PeerInfo peer = selectedPeer;
+        if (peer == null || client.state() != ConnectionState.CONNECTED) return;
+        voiceCallButton.setEnabled(false);
+        videoCallButton.setEnabled(false);
+        new SwingWorker<CallSession, Void>() {
+            @Override protected CallSession doInBackground() throws Exception {
+                return client.startCall(peer.username(), video);
+            }
+            @Override protected void done() {
+                setComposerEnabled(client.state() == ConnectionState.CONNECTED);
+                try { get(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+                catch (ExecutionException failure) { showError(friendlyMessage(failure.getCause())); }
+            }
+        }.execute();
     }
 
     private void updateGroups(List<GroupInfo> groups) {
@@ -744,9 +802,6 @@ public final class MainFrame extends JFrame {
         leaveGroupButton.setVisible(true);
         headerAvatarPanel.repaint();
         setComposerEnabled(client.state() == ConnectionState.CONNECTED);
-        fileButton.setEnabled(false);
-        audioButton.setEnabled(audioRecorder.isRecording());
-        videoButton.setEnabled(false);
         renderHistory();
     }
 
@@ -994,29 +1049,32 @@ public final class MainFrame extends JFrame {
 
     private void chooseAndSendFile() {
         PeerInfo peer = selectedPeer;
-        if (peer == null) {
+        GroupInfo group = selectedGroup;
+        if (peer == null && group == null) {
             return;
         }
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Chọn file gửi trực tiếp cho " + peer.username());
+        chooser.setDialogTitle("Chọn file gửi cho "
+                + (group == null ? peer.username() : "nhóm " + group.name()));
         if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
         }
         Path file = chooser.getSelectedFile().toPath();
-        sendPath(peer, file, fileButton);
+        sendPath(peer, group, file, fileButton);
     }
 
     private void openCamera() {
         PeerInfo peer = selectedPeer;
-        if (peer == null) {
+        GroupInfo group = selectedGroup;
+        if (peer == null && group == null) {
             return;
         }
         videoButton.setEnabled(false);
         try {
-            new CameraCaptureDialog(this, peer.username(),
-                    file -> sendPath(peer, file, videoButton),
+            new CameraCaptureDialog(this, group == null ? peer.username() : group.name(),
+                    file -> sendPath(peer, group, file, videoButton),
                     this::chooseAndSendVideoFile,
-                    () -> videoButton.setEnabled(selectedPeer != null
+                    () -> videoButton.setEnabled((selectedPeer != null || selectedGroup != null)
                             && client.state() == ConnectionState.CONNECTED))
                     .setVisible(true);
         } catch (LinkageError missingCameraLibrary) {
@@ -1027,11 +1085,13 @@ public final class MainFrame extends JFrame {
 
     private void chooseAndSendVideoFile() {
         PeerInfo peer = selectedPeer;
-        if (peer == null) {
+        GroupInfo group = selectedGroup;
+        if (peer == null && group == null) {
             return;
         }
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Chọn video gửi trực tiếp cho " + peer.username());
+        chooser.setDialogTitle("Chọn video gửi cho "
+                + (group == null ? peer.username() : "nhóm " + group.name()));
         chooser.setFileFilter(new FileNameExtensionFilter(
                 "Video (*.mp4, *.mov, *.avi, *.mkv, *.webm)",
                 "mp4", "mov", "avi", "mkv", "webm"));
@@ -1043,7 +1103,7 @@ public final class MainFrame extends JFrame {
             showError("Hãy chọn file video MP4, MOV, AVI, MKV hoặc WEBM.");
             return;
         }
-        sendPath(peer, video, videoButton);
+        sendPath(peer, group, video, videoButton);
     }
 
     private void toggleAudioRecording() {
@@ -1052,7 +1112,8 @@ public final class MainFrame extends JFrame {
             return;
         }
         PeerInfo peer = selectedPeer;
-        if (peer == null) {
+        GroupInfo group = selectedGroup;
+        if (peer == null && group == null) {
             return;
         }
         audioButton.setEnabled(false);
@@ -1068,14 +1129,15 @@ public final class MainFrame extends JFrame {
                 try {
                     get();
                     audioRecordingPeer = peer;
+                    audioRecordingGroup = group == null ? null : group.name();
                     audioButton.setActive(true);
                     audioButton.setToolTipText("Dừng thu và gửi âm thanh");
                     audioButton.setEnabled(true);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    audioButton.setEnabled(selectedPeer != null);
+                    audioButton.setEnabled(selectedPeer != null || selectedGroup != null);
                 } catch (ExecutionException failure) {
-                    audioButton.setEnabled(selectedPeer != null);
+                    audioButton.setEnabled(selectedPeer != null || selectedGroup != null);
                     showError(friendlyMessage(failure.getCause()));
                 }
             }
@@ -1084,6 +1146,7 @@ public final class MainFrame extends JFrame {
 
     private void stopAudioRecording() {
         PeerInfo peer = audioRecordingPeer;
+        String groupName = audioRecordingGroup;
         audioButton.setEnabled(false);
         new SwingWorker<Path, Void>() {
             @Override
@@ -1096,17 +1159,19 @@ public final class MainFrame extends JFrame {
                 audioButton.setActive(false);
                 audioButton.setToolTipText("Thu và gửi âm thanh");
                 audioRecordingPeer = null;
+                audioRecordingGroup = null;
                 try {
                     Path audio = get();
-                    if (peer == null) {
+                    if (peer == null && groupName == null) {
                         throw new IOException("Không còn người nhận âm thanh");
                     }
-                    sendPath(peer, audio, audioButton);
+                    sendPath(peer, groupName == null ? null
+                            : new GroupInfo(groupName, 0, true), audio, audioButton);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    audioButton.setEnabled(selectedPeer != null);
+                    audioButton.setEnabled(selectedPeer != null || selectedGroup != null);
                 } catch (ExecutionException | IOException failure) {
-                    audioButton.setEnabled(selectedPeer != null);
+                    audioButton.setEnabled(selectedPeer != null || selectedGroup != null);
                     Throwable cause = failure instanceof ExecutionException
                             ? failure.getCause() : failure;
                     showError(friendlyMessage(cause));
@@ -1116,32 +1181,47 @@ public final class MainFrame extends JFrame {
     }
 
     private void sendPath(PeerInfo peer, Path file, JButton sourceButton) {
+        sendPath(peer, null, file, sourceButton);
+    }
+
+    private void sendPath(PeerInfo peer, GroupInfo group, Path file, JButton sourceButton) {
         sourceButton.setEnabled(false);
-        new SwingWorker<TransferHandle, Void>() {
+        new SwingWorker<List<TransferHandle>, Void>() {
             @Override
-            protected TransferHandle doInBackground() throws Exception {
-                return client.sendFile(peer.username(), file);
+            protected List<TransferHandle> doInBackground() throws Exception {
+                return group == null ? List.of(client.sendFile(peer.username(), file))
+                        : client.sendGroupFile(group.name(), file);
             }
 
             @Override
             protected void done() {
                 sourceButton.setEnabled(
-                        selectedPeer != null && client.state() == ConnectionState.CONNECTED);
+                        (selectedPeer != null || selectedGroup != null)
+                                && client.state() == ConnectionState.CONNECTED);
                 try {
-                    TransferHandle handle = get();
-                    outgoingSourcePaths.put(handle.fileId(), file);
-                    FileEntry entry = fileEntries.get(handle.fileId());
-                    if (entry != null) {
-                        entry.sourcePath = file;
+                    List<TransferHandle> handles = get();
+                    if (handles.isEmpty()) {
+                        showError("Không có thành viên nhóm nào đang online để nhận file.");
                     }
-                    if (entry == null || entry.isActive()) {
-                        outgoingTransfers.put(handle.fileId(), handle);
+                    for (TransferHandle handle : handles) {
+                        outgoingSourcePaths.put(handle.fileId(), file);
+                        FileEntry entry = fileEntries.get(handle.fileId());
+                        if (entry != null) {
+                            entry.sourcePath = file;
+                        }
+                        if (entry == null || entry.isActive()) {
+                            outgoingTransfers.put(handle.fileId(), handle);
+                        }
                     }
                     renderSelectedConversation();
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                 } catch (ExecutionException failure) {
-                    addFailedFileAttempt(peer, file, friendlyMessage(failure.getCause()));
+                    if (peer != null) {
+                        addFailedFileAttempt(peer, file, friendlyMessage(failure.getCause()));
+                    } else {
+                        showError(friendlyMessage(failure.getCause()));
+                    }
                 }
             }
         }.execute();
@@ -1209,8 +1289,13 @@ public final class MainFrame extends JFrame {
             fileEntries.put(entry.file.fileId(), entry);
             String peer = stored.direction() == TransferDirection.SENDING
                     ? entry.file.receiver() : entry.file.sender();
-            historyPeers.add(peer);
-            histories.computeIfAbsent(peer, ignored -> new ArrayList<>()).add(entry);
+            if (entry.file.groupName() != null) {
+                groupFiles.computeIfAbsent(entry.file.groupName(), ignored -> new ArrayList<>())
+                        .add(entry);
+            } else {
+                historyPeers.add(peer);
+                histories.computeIfAbsent(peer, ignored -> new ArrayList<>()).add(entry);
+            }
         }
         for (List<ConversationEntry> conversation : histories.values()) {
             conversation.sort(Comparator.comparing(entry -> entry instanceof TextEntry text
@@ -1228,8 +1313,14 @@ public final class MainFrame extends JFrame {
         GroupInfo group = selectedGroup;
 
         if (group != null) {
-            for (GroupMessage message : groupHistories.getOrDefault(group.name(), List.of())) {
-                messagesPanel.add(createGroupMessageBubble(message));
+            List<Object> entries = new ArrayList<>();
+            entries.addAll(groupHistories.getOrDefault(group.name(), List.of()));
+            entries.addAll(groupFiles.getOrDefault(group.name(), List.of()));
+            entries.sort(Comparator.comparing(entry -> entry instanceof GroupMessage message
+                    ? message.timestamp() : ((FileEntry) entry).createdAt));
+            for (Object entry : entries) {
+                messagesPanel.add(entry instanceof GroupMessage message
+                        ? createGroupMessageBubble(message) : createFileBubble((FileEntry) entry));
                 messagesPanel.add(Box.createVerticalStrut(10));
             }
             messagesPanel.add(Box.createVerticalGlue());
@@ -1883,16 +1974,25 @@ public final class MainFrame extends JFrame {
             entry = new FileEntry(progress.file(), progress.direction(), Instant.now());
             entry.sourcePath = outgoingSourcePaths.get(progress.file().fileId());
             fileEntries.put(progress.file().fileId(), entry);
-            String peerName = progress.direction() == TransferDirection.SENDING
-                    ? progress.file().receiver() : progress.file().sender();
-            historyPeers.add(peerName);
-            histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
+            addFileToConversation(entry);
         }
         entry.progress = progress;
         if (!entry.isActive()) {
             outgoingTransfers.remove(progress.file().fileId());
         }
         renderFileConversation(entry);
+    }
+
+    private void addFileToConversation(FileEntry entry) {
+        if (entry.file.groupName() != null) {
+            groupFiles.computeIfAbsent(entry.file.groupName(), ignored -> new ArrayList<>())
+                    .add(entry);
+        } else {
+            String peerName = entry.direction == TransferDirection.SENDING
+                    ? entry.file.receiver() : entry.file.sender();
+            historyPeers.add(peerName);
+            histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
+        }
     }
 
     private void markFileCompleted(FileInfo file, Path savedPath) {
@@ -1912,10 +2012,7 @@ public final class MainFrame extends JFrame {
                     ? TransferDirection.SENDING : TransferDirection.RECEIVING;
             entry = new FileEntry(file, direction, Instant.now());
             fileEntries.put(file.fileId(), entry);
-            String peerName = direction == TransferDirection.SENDING
-                    ? file.receiver() : file.sender();
-            historyPeers.add(peerName);
-            histories.computeIfAbsent(peerName, ignored -> new ArrayList<>()).add(entry);
+            addFileToConversation(entry);
         }
         if (entry.progress == null || entry.progress.state() != TransferState.CANCELLED) {
             entry.failureReason = reason;
@@ -2010,6 +2107,12 @@ public final class MainFrame extends JFrame {
     }
 
     private void renderFileConversation(FileEntry entry) {
+        if (entry.file.groupName() != null) {
+            if (selectedGroup != null && selectedGroup.name().equals(entry.file.groupName())) {
+                renderHistory();
+            }
+            return;
+        }
         PeerInfo peer = selectedPeer;
         String peerName = entry.direction == TransferDirection.SENDING
                 ? entry.file.receiver() : entry.file.sender();
@@ -2019,7 +2122,7 @@ public final class MainFrame extends JFrame {
     }
 
     private void renderSelectedConversation() {
-        if (selectedPeer != null) {
+        if (selectedPeer != null || selectedGroup != null) {
             renderHistory();
         }
     }
@@ -2034,14 +2137,19 @@ public final class MainFrame extends JFrame {
     }
 
     private void setComposerEnabled(boolean enabled) {
+        boolean canCall = enabled && selectedPeer != null;
+        voiceCallButton.setEnabled(canCall);
+        videoCallButton.setEnabled(canCall);
+        voiceCallButton.setVisible(selectedPeer != null);
+        videoCallButton.setVisible(selectedPeer != null);
         messageField.setEnabled(enabled);
         sendButton.setEnabled(enabled);
         emojiButton.setEnabled(enabled);
         gifButton.setEnabled(enabled);
-        fileButton.setEnabled(enabled && selectedPeer != null);
+        fileButton.setEnabled(enabled && (selectedPeer != null || selectedGroup != null));
         audioButton.setEnabled(audioRecorder.isRecording()
-                || (enabled && selectedPeer != null));
-        videoButton.setEnabled(enabled && selectedPeer != null);
+                || (enabled && (selectedPeer != null || selectedGroup != null)));
+        videoButton.setEnabled(enabled && (selectedPeer != null || selectedGroup != null));
     }
 
     private void disconnectAndReturn() {
@@ -2056,6 +2164,8 @@ public final class MainFrame extends JFrame {
 
     private void closeClient() {
         if (closed.compareAndSet(false, true)) {
+            for (CallFrame frame : callFrames.values()) frame.dispose();
+            callFrames.clear();
             client.removeEventListener(eventListener);
             connectionTimer.stop();
             audioRecorder.close();

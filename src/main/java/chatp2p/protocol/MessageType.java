@@ -34,7 +34,12 @@ public enum MessageType {
     HISTORY_GET(28),
     HISTORY_PAGE(29),
     CREATE_GROUP(30),
-    CREATE_GROUP_ACK(31);
+    CREATE_GROUP_ACK(31),
+    GET_GROUP_MEMBERS(32),
+    GROUP_MEMBERS(33),
+    CALL_INVITE(34),
+    CALL_ACCEPT(35),
+    CALL_REJECT(36);
 
     private final int wireCode;
 

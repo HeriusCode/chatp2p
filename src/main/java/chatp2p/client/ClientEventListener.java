@@ -8,6 +8,7 @@ import chatp2p.model.PeerInfo;
 import chatp2p.model.TransferProgress;
 
 import java.nio.file.Path;
+import java.awt.image.BufferedImage;
 import java.util.List;
 
 /** Events raised by background control and peer network threads. */
@@ -38,5 +39,11 @@ public interface ClientEventListener {
     }
 
     default void onTransferFailed(FileInfo file, String reason) {
+    }
+
+    default void onCallChanged(CallSession call) {
+    }
+
+    default void onCallVideoFrame(CallSession call, BufferedImage frame, boolean local) {
     }
 }

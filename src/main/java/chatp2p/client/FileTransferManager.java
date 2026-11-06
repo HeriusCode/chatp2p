@@ -61,6 +61,10 @@ final class FileTransferManager implements AutoCloseable {
     }
 
     TransferHandle send(PeerInfo peer, Path source) throws IOException {
+        return send(peer, source, null);
+    }
+
+    TransferHandle send(PeerInfo peer, Path source, String groupName) throws IOException {
         Path file = source.toAbsolutePath().normalize();
         if (!Files.isRegularFile(file) || !Files.isReadable(file)) {
             throw new IOException("File does not exist or is not readable: " + file);
@@ -71,7 +75,7 @@ final class FileTransferManager implements AutoCloseable {
         }
         FileInfo info = new FileInfo(
                 UUID.randomUUID(), sanitizeFileName(file.getFileName().toString()), size,
-                localUsername, peer.username());
+                localUsername, peer.username(), groupName);
         OutgoingTransfer transfer = new OutgoingTransfer(peer, file, info);
         transferPool.execute(transfer);
         return transfer;
@@ -303,6 +307,7 @@ final class FileTransferManager implements AutoCloseable {
                 .field("fileSize", Long.toString(info.size()))
                 .field("sender", info.sender())
                 .field("receiver", info.receiver())
+                .field("groupName", info.groupName() == null ? "" : info.groupName())
                 .build();
     }
 
@@ -317,7 +322,9 @@ final class FileTransferManager implements AutoCloseable {
                     sanitizeFileName(request.requiredField("fileName")),
                     size,
                     request.requiredField("sender"),
-                    request.requiredField("receiver"));
+                    request.requiredField("receiver"),
+                    request.field("groupName") == null || request.field("groupName").isBlank()
+                            ? null : request.field("groupName"));
         } catch (IllegalArgumentException invalidMetadata) {
             throw new IOException("Invalid file metadata", invalidMetadata);
         }

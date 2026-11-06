@@ -81,6 +81,26 @@ final class GroupManager {
         return members != null && members.contains(username);
     }
 
+    ProtocolMessage onlineMembers(ProtocolMessage request, String username) throws IOException {
+        String name = request.requiredField("groupName");
+        Set<String> members = groups.get(name);
+        if (members == null || !members.contains(username)) {
+            throw new IOException("Bạn chưa tham gia nhóm " + name);
+        }
+        List<UserManager.OnlineSession> online = users.snapshot().stream()
+                .filter(session -> !session.username().equals(username)
+                        && members.contains(session.username())).toList();
+        ProtocolMessage.Builder result = ProtocolMessage.responseTo(request, MessageType.GROUP_MEMBERS)
+                .field("count", Integer.toString(online.size()));
+        for (int i = 0; i < online.size(); i++) {
+            UserManager.OnlineSession peer = online.get(i);
+            result.field("user." + i + ".name", peer.username())
+                    .field("user." + i + ".host", peer.peerHost())
+                    .field("user." + i + ".port", Integer.toString(peer.peerPort()));
+        }
+        return result.build();
+    }
+
     List<GroupInfo> snapshot(String username) {
         List<GroupInfo> result = new ArrayList<>();
         groups.forEach((name, members) ->

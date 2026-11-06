@@ -26,6 +26,7 @@ final class PeerServer implements AutoCloseable {
     private final String localUsername;
     private final Consumer<ChatMessage> chatListener;
     private final FileTransferManager fileTransferManager;
+    private final CallManager callManager;
     private final Consumer<String> errorListener;
     private final ExecutorService acceptExecutor;
     private final ExecutorService handlerPool;
@@ -36,10 +37,12 @@ final class PeerServer implements AutoCloseable {
             String localUsername,
             Consumer<ChatMessage> chatListener,
             FileTransferManager fileTransferManager,
+            CallManager callManager,
             Consumer<String> errorListener) {
         this.localUsername = localUsername;
         this.chatListener = chatListener;
         this.fileTransferManager = fileTransferManager;
+        this.callManager = callManager;
         this.errorListener = errorListener;
         this.acceptExecutor = Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "peer-accept-" + localUsername);
@@ -117,6 +120,9 @@ final class PeerServer implements AutoCloseable {
                 fileTransfer = true;
                 socket.setSoTimeout(0);
                 fileTransferManager.receive(request, input, output);
+            } else if (request.type() == MessageType.CALL_INVITE) {
+                socket.setSoTimeout(65_000);
+                callManager.incoming(request, socket, input, output);
             } else {
                 sendError(output, request, "UNSUPPORTED_PEER_MESSAGE");
             }

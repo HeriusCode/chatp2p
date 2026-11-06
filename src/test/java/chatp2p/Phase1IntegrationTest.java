@@ -2,6 +2,7 @@ package chatp2p;
 
 import chatp2p.client.ChatClient;
 import chatp2p.client.ChatHistoryStore;
+import chatp2p.client.CallSession;
 import chatp2p.client.ClientEventListener;
 import chatp2p.client.ConnectionState;
 import chatp2p.client.LanServerDiscovery;
@@ -144,6 +145,9 @@ public final class Phase1IntegrationTest {
                 check(chatReceived.await(5, TimeUnit.SECONDS), "P2P chat was not received");
 
                 testFileTransfer(first, second);
+                testCall(first, second, false);
+                testCall(first, second, true);
+                testRejectedCall(first, second);
                 testGroupChat(first, second);
                 expectIOException(() -> first.createGroup(
                                 "phase1-invalid", java.util.List.of("no-such-account")),
@@ -187,8 +191,11 @@ public final class Phase1IntegrationTest {
             check(secondHistory.load().groupMessages().stream()
                     .filter(message -> message.content().equals("hello-group")).count() == 1,
                     "receiver group history was missing or duplicated");
-            check(secondHistory.load().files().size() == 1,
+            check(secondHistory.load().files().size() == 2,
                     "receiver file history did not survive restart");
+            check(secondHistory.load().files().stream().anyMatch(item ->
+                            "phase1-room".equals(item.file().groupName())),
+                    "group file history did not survive restart");
             check(new ChatHistoryStore("another-account", "127.0.0.1",
                     server.boundPort(), historyFile).load().directMessages().isEmpty(),
                     "history was visible to another account");
@@ -204,6 +211,9 @@ public final class Phase1IntegrationTest {
                         "PostgreSQL group history was not restored on another cache");
                 check(!recovered.files().isEmpty(),
                         "PostgreSQL file metadata was not restored on another cache");
+            check(recovered.files().stream().anyMatch(item ->
+                            "phase1-room".equals(item.file().groupName())),
+                    "PostgreSQL group file metadata was not restored");
             }
             ChatServer reloadedServer = new ChatServer(0);
             ExecutorService reloadedThread = Executors.newSingleThreadExecutor();
@@ -249,8 +259,8 @@ public final class Phase1IntegrationTest {
                 check(invalidGroup.next() && invalidGroup.getInt(1) == 0,
                         "failed invitation left a partial group in PostgreSQL");
             }
-            System.out.println("PASS: auth, UDP Broadcast discovery, P2P chat/file, "
-                    + "UDP Multicast group send, PostgreSQL accounts/groups/history, and shutdown");
+            System.out.println("PASS: auth, UDP discovery, P2P chat/file/calls, "
+                    + "group chat/media, PostgreSQL accounts/groups/history, and shutdown");
         } finally {
             server.close();
             serverThread.shutdown();
@@ -332,11 +342,98 @@ public final class Phase1IntegrationTest {
         });
         sender.sendGroupChat(group, "hello-group");
         check(delivered.await(5, TimeUnit.SECONDS), "group chat was not received");
+        testGroupFile(sender, receiver, group);
         receiver.leaveGroup(group);
         expectIOException(
                 () -> receiver.sendGroupChat(group, "must-fail"),
                 "non-member was allowed to send group chat");
         sender.leaveGroup(group);
+    }
+
+    private static void testGroupFile(ChatClient sender, ChatClient receiver, String group)
+            throws Exception {
+        Path source = Files.createTempFile("chatp2p-group-", ".bin");
+        Files.writeString(source, "group-media-test", StandardCharsets.UTF_8);
+        CountDownLatch received = new CountDownLatch(1);
+        AtomicReference<Path> saved = new AtomicReference<>();
+        ClientEventListener listener = new ClientEventListener() {
+            @Override public boolean onFileOffered(FileInfo file) {
+                return group.equals(file.groupName());
+            }
+            @Override public void onTransferCompleted(FileInfo file, Path path) {
+                if (group.equals(file.groupName())) {
+                    saved.set(path);
+                    received.countDown();
+                }
+            }
+        };
+        receiver.addEventListener(listener);
+        try {
+            check(sender.sendGroupFile(group, source).size() == 1,
+                    "group media was not sent to the online member");
+            check(received.await(10, TimeUnit.SECONDS), "group media timed out");
+            check(saved.get() != null && Files.mismatch(source, saved.get()) == -1,
+                    "group media content differs from source");
+        } finally {
+            receiver.removeEventListener(listener);
+            Files.deleteIfExists(source);
+            if (saved.get() != null) Files.deleteIfExists(saved.get());
+        }
+    }
+
+    private static void testCall(ChatClient caller, ChatClient receiver, boolean video)
+            throws Exception {
+        CountDownLatch connected = new CountDownLatch(2);
+        CountDownLatch ended = new CountDownLatch(2);
+        ClientEventListener incoming = new ClientEventListener() {
+            @Override public void onCallChanged(CallSession call) {
+                if (call.state() == CallSession.State.RINGING) call.accept();
+                if (call.state() == CallSession.State.CONNECTED) connected.countDown();
+                if (call.state() == CallSession.State.ENDED) ended.countDown();
+            }
+        };
+        ClientEventListener outgoing = new ClientEventListener() {
+            @Override public void onCallChanged(CallSession call) {
+                if (call.state() == CallSession.State.CONNECTED) connected.countDown();
+                if (call.state() == CallSession.State.ENDED) ended.countDown();
+            }
+        };
+        receiver.addEventListener(incoming);
+        caller.addEventListener(outgoing);
+        try {
+            CallSession call = caller.startCall(receiver.clientName(), video);
+            check(connected.await(5, TimeUnit.SECONDS), "P2P call did not connect");
+            call.close();
+            check(ended.await(5, TimeUnit.SECONDS), "P2P call did not end on both peers");
+        } finally {
+            receiver.removeEventListener(incoming);
+            caller.removeEventListener(outgoing);
+        }
+    }
+
+    private static void testRejectedCall(ChatClient caller, ChatClient receiver)
+            throws Exception {
+        CountDownLatch rejected = new CountDownLatch(1);
+        ClientEventListener incoming = new ClientEventListener() {
+            @Override public void onCallChanged(CallSession call) {
+                if (call.state() == CallSession.State.RINGING) call.reject();
+            }
+        };
+        ClientEventListener outgoing = new ClientEventListener() {
+            @Override public void onCallChanged(CallSession call) {
+                if (call.state() == CallSession.State.ENDED
+                        && call.status().contains("từ chối")) rejected.countDown();
+            }
+        };
+        receiver.addEventListener(incoming);
+        caller.addEventListener(outgoing);
+        try {
+            caller.startCall(receiver.clientName(), false);
+            check(rejected.await(5, TimeUnit.SECONDS), "P2P call rejection did not reach caller");
+        } finally {
+            receiver.removeEventListener(incoming);
+            caller.removeEventListener(outgoing);
+        }
     }
 
     private static void expectIOException(CheckedAction action, String failureMessage)

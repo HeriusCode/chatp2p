@@ -4,7 +4,12 @@ import java.util.UUID;
 
 /** Metadata announced before any file bytes are transferred. */
 public record FileInfo(
-        UUID fileId, String fileName, long size, String sender, String receiver) {
+        UUID fileId, String fileName, long size, String sender, String receiver,
+        String groupName) {
+    public FileInfo(UUID fileId, String fileName, long size, String sender, String receiver) {
+        this(fileId, fileName, size, sender, receiver, null);
+    }
+
     public FileInfo {
         if (fileId == null) {
             throw new IllegalArgumentException("fileId is required");
@@ -17,6 +22,9 @@ public record FileInfo(
         }
         if (sender == null || sender.isBlank() || receiver == null || receiver.isBlank()) {
             throw new IllegalArgumentException("sender and receiver are required");
+        }
+        if (groupName != null && (groupName.isBlank() || groupName.length() > 32)) {
+            throw new IllegalArgumentException("Invalid group name");
         }
     }
 }

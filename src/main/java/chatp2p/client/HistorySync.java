@@ -61,6 +61,7 @@ final class HistorySync {
                     .field("id", file.fileId().toString())
                     .field("sender", file.sender())
                     .field("receiver", file.receiver())
+                    .field("conversation", file.groupName() == null ? "" : file.groupName())
                     .field("time", Long.toString(item.createdAt().toEpochMilli()))
                     .field("fileName", file.fileName())
                     .field("fileSize", Long.toString(file.size()))
@@ -128,7 +129,10 @@ final class HistorySync {
                 case "FILE" -> {
                     FileInfo file = new FileInfo(id, page.requiredField(prefix + "fileName"),
                             Long.parseLong(page.requiredField(prefix + "fileSize")), sender,
-                            page.requiredField(prefix + "receiver"));
+                            page.requiredField(prefix + "receiver"),
+                            page.field(prefix + "conversation") == null
+                                    || page.field(prefix + "conversation").isBlank()
+                                    ? null : page.field(prefix + "conversation"));
                     String savedName = page.field(prefix + "savedName");
                     Path saved = null;
                     if (savedName != null && !savedName.isBlank()) {
