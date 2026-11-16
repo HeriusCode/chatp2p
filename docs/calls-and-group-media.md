@@ -2,7 +2,7 @@
 
 ## Media trong nhóm
 
-Trong tab **Nhóm**, chọn nhóm đã tham gia rồi dùng các nút đính kèm, micro hoặc camera. File, bản ghi WAV, ảnh và video đều được truyền bằng TCP trực tiếp từ máy gửi tới từng thành viên đang online. Server chỉ cung cấp danh sách endpoint của những thành viên được phép nhận. Người offline không nhận lại byte file khi đăng nhập; PostgreSQL lưu metadata và SQLite lưu đường dẫn file cục bộ. Ảnh và video dùng lại phần xem trước trong hội thoại. Người nhận có thể tải bản sao từ file đã lưu trên máy mình.
+Trong tab **Nhóm**, chọn nhóm đã tham gia rồi dùng các nút đính kèm, micro hoặc camera. File, bản ghi WAV, ảnh và video đều được truyền bằng TCP trực tiếp từ máy gửi tới từng thành viên đang online. Server chỉ cung cấp danh sách endpoint của những thành viên được phép nhận. Người offline không nhận lại byte file khi đăng nhập; PostgreSQL lưu metadata, còn nội dung file nằm trên máy nhận. Ảnh và video dùng lại phần xem trước trong hội thoại. Người nhận có thể tải bản sao từ file đã lưu trên máy mình.
 
 ## Gọi thoại và gọi video
 

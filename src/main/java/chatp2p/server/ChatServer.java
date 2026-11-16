@@ -46,12 +46,13 @@ public final class ChatServer implements AutoCloseable {
         this(port, DEFAULT_MAX_CLIENTS, ServerLogger.create(), eventListener);
     }
 
-    public ChatServer(int port, int maxClients, Logger logger) {
+    public ChatServer(int port, int maxClients, Logger logger) throws IOException {
         this(port, maxClients, logger, ServerEventListener.noOp());
     }
 
     public ChatServer(
-            int port, int maxClients, Logger logger, ServerEventListener eventListener) {
+            int port, int maxClients, Logger logger, ServerEventListener eventListener)
+            throws IOException {
         if (port < 0 || port > 65_535) {
             throw new IllegalArgumentException("Port must be between 0 and 65535");
         }
@@ -67,17 +68,9 @@ public final class ChatServer implements AutoCloseable {
         this.logger = Objects.requireNonNull(logger, "logger");
         this.eventListener = Objects.requireNonNull(eventListener, "eventListener");
         this.userManager = new UserManager(logger);
-        try {
-            this.database = new PostgresDatabase();
-            this.accountStore = new AccountStore(database);
-            int imported = LegacyHistoryImporter.importLocal(database);
-            if (imported > 0) {
-                logger.info("Imported " + imported + " local history records into PostgreSQL");
-            }
-            this.groupManager = new GroupManager(userManager, logger, database);
-        } catch (IOException failure) {
-            throw new IllegalStateException("Cannot initialize PostgreSQL", failure);
-        }
+        this.database = new PostgresDatabase();
+        this.accountStore = new AccountStore(database);
+        this.groupManager = new GroupManager(userManager, logger, database);
     }
 
     /** Binds the port and runs the accept loop until close() is called. */

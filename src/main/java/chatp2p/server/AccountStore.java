@@ -3,7 +3,6 @@ package chatp2p.server;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -17,20 +16,19 @@ import javax.crypto.spec.PBEKeySpec;
 
 /** Persistent PBKDF2 account store. Passwords are never written as plain text. */
 final class AccountStore {
-    private static final Path DEFAULT_STORE_PATH = Path.of("data", "users.dat");
     private static final int ITERATIONS = 120_000;
     private static final int HASH_BITS = 256;
     private static final int SALT_BYTES = 16;
 
     private final SecureRandom random = new SecureRandom();
-    private final Path storePath;
+    private final java.nio.file.Path legacyStorePath;
     private final PostgresDatabase database;
 
     AccountStore(PostgresDatabase database) throws IOException {
         this.database = database;
         String configuredPath = System.getProperty("chatp2p.usersFile");
-        storePath = configuredPath == null || configuredPath.isBlank()
-                ? DEFAULT_STORE_PATH : Path.of(configuredPath);
+        legacyStorePath = configuredPath == null || configuredPath.isBlank()
+                ? null : java.nio.file.Path.of(configuredPath);
         importLegacyAccounts();
     }
 
@@ -87,19 +85,19 @@ final class AccountStore {
     }
 
     private void importLegacyAccounts() throws IOException {
-        if (!Files.exists(storePath)) {
+        if (legacyStorePath == null || !Files.exists(legacyStorePath)) {
             return;
         }
         String sql = "INSERT INTO accounts(username, iterations, salt, password_hash) "
                 + "VALUES (?, ?, ?, ?) ON CONFLICT(username) DO NOTHING";
         try (Connection connection = database.open(); PreparedStatement insert = connection.prepareStatement(sql)) {
-            for (String line : Files.readAllLines(storePath, StandardCharsets.UTF_8)) {
+            for (String line : Files.readAllLines(legacyStorePath, StandardCharsets.UTF_8)) {
                 if (line.isBlank()) {
                     continue;
                 }
                 String[] fields = line.split("\\|", -1);
                 if (fields.length != 4) {
-                    throw new IOException("Invalid account record in " + storePath);
+                    throw new IOException("Invalid account record in " + legacyStorePath);
                 }
                 try {
                     insert.setString(1, fields[0]);
@@ -112,7 +110,7 @@ final class AccountStore {
                 }
             }
         } catch (SQLException failure) {
-            throw new IOException("Cannot import data/users.dat into PostgreSQL", failure);
+            throw new IOException("Cannot import legacy account file into PostgreSQL", failure);
         }
     }
 

@@ -40,19 +40,12 @@ public final class ChatClient implements AutoCloseable {
                 thread.setDaemon(true);
                 return thread;
             });
-    private final java.util.concurrent.ExecutorService historyExecutor =
-            Executors.newSingleThreadExecutor(runnable -> {
-                Thread thread = new Thread(runnable, "history-postgres-sync");
-                thread.setDaemon(true);
-                return thread;
-            });
     private volatile ServerConnection connection;
     private volatile PeerServer peerServer;
     private volatile FileTransferManager fileTransferManager;
     private volatile CallManager callManager;
     private volatile MulticastGroupChannel multicastChannel;
     private volatile ChatHistoryStore historyStore;
-    private volatile HistorySync historySync;
     private final ConcurrentHashMap<UUID, Boolean> seenGroupMessages = new ConcurrentHashMap<>();
     private volatile List<PeerInfo> onlineUsers = List.of();
     private volatile List<GroupInfo> groups = List.of();
@@ -120,8 +113,7 @@ public final class ChatClient implements AutoCloseable {
             ProtocolMessage response = newConnection.request(login, REQUEST_TIMEOUT);
             requireType(response, MessageType.LOGIN_ACK);
             createGroupSupported = Boolean.parseBoolean(response.field("createGroupSupported"));
-            historyStore = new ChatHistoryStore(requestedClientName, host, port);
-            historySync = new HistorySync(historyStore, newConnection);
+            historyStore = new ChatHistoryStore(requestedClientName, newConnection);
             clientName = requestedClientName;
             state.set(ConnectionState.CONNECTED);
             try {
@@ -147,7 +139,6 @@ public final class ChatClient implements AutoCloseable {
             fileTransferManager = null;
             callManager = null;
             historyStore = null;
-            historySync = null;
             createGroupSupported = false;
             state.set(ConnectionState.DISCONNECTED);
             throw failure;
@@ -330,7 +321,6 @@ public final class ChatClient implements AutoCloseable {
                         .field("timestamp", message.timestamp().toString())
                         .build(), REQUEST_TIMEOUT);
         requireType(response, MessageType.GROUP_CHAT);
-        saveHistory(store -> store.save(message));
         seenGroupMessages.put(message.messageId(), Boolean.TRUE);
         MulticastGroupChannel channel = multicastChannel;
         if (channel != null) {
@@ -357,11 +347,6 @@ public final class ChatClient implements AutoCloseable {
 
     public ChatHistoryStore.Snapshot loadHistory() throws IOException {
         ChatHistoryStore store = historyStore;
-        HistorySync sync = historySync;
-        if (sync != null) {
-            sync.uploadLocal();
-            sync.downloadRemote();
-        }
         return store == null
                 ? new ChatHistoryStore.Snapshot(List.of(), List.of(), List.of())
                 : store.load();
@@ -439,14 +424,12 @@ public final class ChatClient implements AutoCloseable {
         callManager = null;
         multicastChannel = null;
         historyStore = null;
-        historySync = null;
         createGroupSupported = false;
         seenGroupMessages.clear();
         onlineUsers = List.of();
         groups = List.of();
         state.set(ConnectionState.DISCONNECTED);
         heartbeatExecutor.shutdownNow();
-        historyExecutor.shutdown();
     }
 
     private void handleServerEvent(ProtocolMessage message) {
@@ -486,7 +469,6 @@ public final class ChatClient implements AutoCloseable {
             seenGroupMessages.clear();
             seenGroupMessages.put(message.messageId(), Boolean.TRUE);
         }
-        saveHistory(store -> store.save(message));
         for (ClientEventListener listener : listeners) {
             listener.onGroupChatReceived(message);
         }
@@ -670,16 +652,6 @@ public final class ChatClient implements AutoCloseable {
         }
         try {
             operation.save(store);
-            HistorySync sync = historySync;
-            if (sync != null) {
-                historyExecutor.execute(() -> {
-                    try {
-                        sync.uploadLocal();
-                    } catch (IOException failure) {
-                        notifyConnectionError("Không thể đồng bộ lịch sử: " + failure.getMessage());
-                    }
-                });
-            }
         } catch (IOException failure) {
             notifyConnectionError(failure.getMessage());
         }

@@ -35,7 +35,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class FileTransferManager implements AutoCloseable {
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final long MAX_FILE_SIZE = 10L * 1024 * 1024 * 1024;
-    private static final Path RECEIVE_DIRECTORY = Path.of("data", "received_files");
+    private static final Path RECEIVE_DIRECTORY = Path.of(
+            System.getProperty("java.io.tmpdir"), "chatp2p", "received-files");
 
     interface Callbacks {
         boolean offer(FileInfo file);

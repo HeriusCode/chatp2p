@@ -312,7 +312,8 @@ final class CameraCaptureDialog extends JDialog {
     }
 
     private static Path newCaptureFile(String extension) throws IOException {
-        Path folder = Path.of("data", "captured_media");
+        Path folder = Path.of(System.getProperty("java.io.tmpdir"),
+                "chatp2p", "captured-media");
         Files.createDirectories(folder);
         return folder.resolve("camera-" + FILE_TIME.format(LocalDateTime.now()) + "-"
                 + UUID.randomUUID().toString().substring(0, 8) + "." + extension);

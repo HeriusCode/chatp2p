@@ -10,8 +10,6 @@ $mainOutput = Join-Path $projectRoot 'target\classes'
 $testOutput = Join-Path $projectRoot 'target\test-classes'
 $dependencyOutput = Join-Path $projectRoot 'target\dependency'
 $legacyOutput = Join-Path $projectRoot 'build'
-$sqliteVersion = '3.54.1.0'
-$sqliteJar = Join-Path $dependencyOutput "sqlite-jdbc-$sqliteVersion.jar"
 $postgresVersion = '42.7.14'
 $postgresJar = Join-Path $dependencyOutput "postgresql-$postgresVersion.jar"
 $cameraDependencies = @(
@@ -52,24 +50,6 @@ Reset-BuildDirectory -Path $legacyOutput
 
 New-Item -ItemType Directory -Force -Path $mainOutput | Out-Null
 New-Item -ItemType Directory -Force -Path $dependencyOutput | Out-Null
-if (-not (Test-Path -LiteralPath $sqliteJar)) {
-    $cachedJar = Join-Path $env:USERPROFILE ".m2\repository\org\xerial\sqlite-jdbc\$sqliteVersion\sqlite-jdbc-$sqliteVersion.jar"
-    if (Test-Path -LiteralPath $cachedJar) {
-        Copy-Item -LiteralPath $cachedJar -Destination $sqliteJar
-    } else {
-        $download = "$sqliteJar.download"
-        $url = "https://repo.maven.apache.org/maven2/org/xerial/sqlite-jdbc/$sqliteVersion/sqlite-jdbc-$sqliteVersion.jar"
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $download -UseBasicParsing
-            Move-Item -LiteralPath $download -Destination $sqliteJar
-        } catch {
-            if (Test-Path -LiteralPath $download) {
-                Remove-Item -LiteralPath $download -Force
-            }
-            throw "Cannot download SQLite JDBC. Check network access to Maven Central: $_"
-        }
-    }
-}
 if (-not (Test-Path -LiteralPath $postgresJar)) {
     $cachedPostgres = Join-Path $env:USERPROFILE ".m2\repository\org\postgresql\postgresql\$postgresVersion\postgresql-$postgresVersion.jar"
     if (Test-Path -LiteralPath $cachedPostgres) {
@@ -131,13 +111,13 @@ if ($RunTests) {
     New-Item -ItemType Directory -Force -Path $testOutput | Out-Null
     $testSources = @(Get-ChildItem -LiteralPath $testRoot -Filter '*.java' -Recurse |
         ForEach-Object { $_.FullName })
-    & javac --release 17 -encoding UTF-8 -cp "$mainOutput;$sqliteJar;$postgresJar;$cameraClasspath" -d $testOutput $testSources
+    & javac --release 17 -encoding UTF-8 -cp "$mainOutput;$postgresJar;$cameraClasspath" -d $testOutput $testSources
     if ($LASTEXITCODE -ne 0) {
         throw 'Test source compilation failed.'
     }
     Push-Location $projectRoot
     try {
-        & java -ea -cp "$mainOutput;$testOutput;$sqliteJar;$postgresJar;$cameraClasspath" chatp2p.Phase1IntegrationTest
+        & java -ea -cp "$mainOutput;$testOutput;$postgresJar;$cameraClasspath" chatp2p.Phase1IntegrationTest
         if ($LASTEXITCODE -ne 0) {
             throw 'Phase 1 integration test failed.'
         }

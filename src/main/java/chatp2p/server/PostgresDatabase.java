@@ -38,12 +38,19 @@ final class PostgresDatabase {
         }
         url = System.getProperty("chatp2p.db.url",
                 System.getenv().getOrDefault("CHATP2P_DB_URL",
-                        config.getProperty("url", "jdbc:postgresql://localhost:5432/chatp2p")));
+                        config.getProperty("url", ""))).trim();
         credentials = new Properties();
-        credentials.setProperty("user", System.getenv().getOrDefault("CHATP2P_DB_USER",
-                config.getProperty("user", "postgres")));
-        credentials.setProperty("password", System.getenv().getOrDefault("CHATP2P_DB_PASSWORD",
-                config.getProperty("password", "")));
+        String user = System.getenv().getOrDefault("CHATP2P_DB_USER",
+                config.getProperty("user", "")).trim();
+        String password = System.getenv().getOrDefault("CHATP2P_DB_PASSWORD",
+                config.getProperty("password", ""));
+        if (url.isBlank() || user.isBlank() || password.isBlank()
+                || password.equals("YOUR_POSTGRES_PASSWORD")) {
+            throw new IOException("Thiếu cấu hình PostgreSQL trong " + file
+                    + " (url, user hoặc password)");
+        }
+        credentials.setProperty("user", user);
+        credentials.setProperty("password", password);
         try (Connection connection = open(); Statement schema = connection.createStatement()) {
             schema.execute("""
                     CREATE TABLE IF NOT EXISTS accounts (

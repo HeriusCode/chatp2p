@@ -32,6 +32,7 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
@@ -228,7 +229,7 @@ public final class ServerDashboardFrame extends JFrame {
 
     private JPanel createServerLogPanel() {
         JPanel section = sectionPanel("SERVER LOG");
-        JLabel logPath = UiTheme.label("data/logs/server.log",
+        JLabel logPath = UiTheme.label("Console (không ghi file cục bộ)",
                 new Font("Segoe UI", Font.PLAIN, 11), UiTheme.MUTED);
         ((JPanel) section.getComponent(0)).add(logPath, BorderLayout.EAST);
 
@@ -284,27 +285,30 @@ public final class ServerDashboardFrame extends JFrame {
         setStartingUi();
         appendLog("INFO", "Starting server on " + serverIpField.getText() + ":" + port);
 
-        try {
-            ChatServer newServer = new ChatServer(port, this::receiveEvent);
-            server = newServer;
-            serverExecutor.execute(() -> {
-                try {
-                    newServer.start();
-                } catch (IOException failure) {
-                    SwingUtilities.invokeLater(() -> {
-                        appendLog("ERROR", "Cannot start server: " + failure.getMessage());
-                        setRunningUi(false);
-                    });
-                } finally {
-                    if (server == newServer) {
-                        server = null;
-                    }
+        serverExecutor.execute(() -> {
+            ChatServer newServer = null;
+            try {
+                newServer = new ChatServer(port, this::receiveEvent);
+                server = newServer;
+                newServer.start();
+            } catch (IOException | RuntimeException failure) {
+                String message = rootCauseMessage(failure);
+                SwingUtilities.invokeLater(() -> {
+                    appendLog("ERROR", "Cannot start server: " + message);
+                    setRunningUi(false);
+                    JOptionPane.showMessageDialog(
+                            this,
+                            "Không thể khởi động server.\n" + message
+                                    + "\n\nHãy kiểm tra data/db.properties và kết nối mạng.",
+                            "Lỗi PostgreSQL",
+                            JOptionPane.ERROR_MESSAGE);
+                });
+            } finally {
+                if (server == newServer) {
+                    server = null;
                 }
-            });
-        } catch (IOException failure) {
-            appendLog("ERROR", "Cannot initialize logger: " + failure.getMessage());
-            setRunningUi(false);
-        }
+            }
+        });
     }
 
     private void stopServer() {
@@ -453,6 +457,17 @@ public final class ServerDashboardFrame extends JFrame {
         } catch (NumberFormatException invalidNumber) {
             throw new IllegalArgumentException("Port must be an integer.", invalidNumber);
         }
+    }
+
+    private static String rootCauseMessage(Throwable failure) {
+        Throwable cause = failure;
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        String message = cause.getMessage();
+        return message == null || message.isBlank()
+                ? cause.getClass().getSimpleName()
+                : message;
     }
 
     private static String detectWifiServerIp() {

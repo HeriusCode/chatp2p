@@ -1,12 +1,9 @@
 package chatp2p.server;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.logging.ConsoleHandler;
-import java.util.logging.FileHandler;
 import java.util.logging.Formatter;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -14,7 +11,6 @@ import java.util.logging.Logger;
 
 /** Creates the server logger without a third-party logging dependency. */
 public final class ServerLogger {
-    private static final Path LOG_PATH = Path.of("data", "logs", "server.log");
     private static volatile Logger sharedLogger;
 
     private ServerLogger() {
@@ -24,7 +20,6 @@ public final class ServerLogger {
         if (sharedLogger != null) {
             return sharedLogger;
         }
-        Files.createDirectories(LOG_PATH.getParent());
         Logger logger = Logger.getLogger("chatp2p.server");
         logger.setUseParentHandlers(false);
         logger.setLevel(Level.INFO);
@@ -39,11 +34,6 @@ public final class ServerLogger {
                         + record.getLevel() + " " + formatMessage(record) + System.lineSeparator();
             }
         };
-
-        FileHandler fileHandler = new FileHandler(LOG_PATH.toString(), true);
-        fileHandler.setEncoding("UTF-8");
-        fileHandler.setFormatter(formatter);
-        logger.addHandler(fileHandler);
 
         ConsoleHandler consoleHandler = new ConsoleHandler();
         consoleHandler.setFormatter(formatter);

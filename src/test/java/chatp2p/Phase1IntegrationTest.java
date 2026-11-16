@@ -74,11 +74,6 @@ public final class Phase1IntegrationTest {
                 + Base64.getEncoder().encodeToString(hash) + System.lineSeparator(),
                 StandardCharsets.UTF_8);
         System.setProperty("chatp2p.usersFile", accountFile.toString());
-        Path historyFile = Files.createTempFile("chatp2p-test-history-", ".db");
-        Files.deleteIfExists(historyFile);
-        System.setProperty("chatp2p.historyFile", historyFile.toString());
-        Path remoteHistoryFile = Files.createTempFile("chatp2p-test-remote-", ".db");
-        Files.deleteIfExists(remoteHistoryFile);
         try (DatagramSocket availablePort = new DatagramSocket(0)) {
             System.setProperty(
                     "chatp2p.discoveryPort", Integer.toString(availablePort.getLocalPort()));
@@ -175,45 +170,36 @@ public final class Phase1IntegrationTest {
                     check(!afterAbort.ping().isNegative(), "post-abort ping duration is invalid");
                 }
             }
-            ChatHistoryStore firstHistory = new ChatHistoryStore(
-                    "phase1-a", "127.0.0.1", server.boundPort(), historyFile);
-            ChatHistoryStore secondHistory = new ChatHistoryStore(
-                    "phase1-b", "127.0.0.1", server.boundPort(), historyFile);
-            check(firstHistory.load().directMessages().stream()
-                    .anyMatch(message -> message.content().equals("direct-p2p-test")),
-                    "sender P2P history did not survive restart");
-            check(secondHistory.load().directMessages().stream()
-                    .anyMatch(message -> message.content().equals("direct-p2p-test")),
-                    "receiver P2P history did not survive restart");
-            check(firstHistory.load().groupMessages().stream()
-                    .anyMatch(message -> message.content().equals("hello-group")),
-                    "group history did not survive restart");
-            check(secondHistory.load().groupMessages().stream()
-                    .filter(message -> message.content().equals("hello-group")).count() == 1,
-                    "receiver group history was missing or duplicated");
-            check(secondHistory.load().files().size() == 2,
-                    "receiver file history did not survive restart");
-            check(secondHistory.load().files().stream().anyMatch(item ->
-                            "phase1-room".equals(item.file().groupName())),
-                    "group file history did not survive restart");
-            check(new ChatHistoryStore("another-account", "127.0.0.1",
-                    server.boundPort(), historyFile).load().directMessages().isEmpty(),
-                    "history was visible to another account");
-            System.setProperty("chatp2p.historyFile", remoteHistoryFile.toString());
-            try (ChatClient restored = new ChatClient()) {
-                restored.connect("127.0.0.1", server.boundPort(), "phase1-b", TEST_PASSWORD);
-                ChatHistoryStore.Snapshot recovered = restored.loadHistory();
-                check(recovered.directMessages().stream()
+            try (ChatClient restoredSender = new ChatClient();
+                 ChatClient restoredReceiver = new ChatClient();
+                 ChatClient unrelated = new ChatClient()) {
+                restoredSender.connect("127.0.0.1", server.boundPort(),
+                        "phase1-a", TEST_PASSWORD);
+                restoredReceiver.connect("127.0.0.1", server.boundPort(),
+                        "phase1-b", TEST_PASSWORD);
+                unrelated.connect("127.0.0.1", server.boundPort(),
+                        "after-abort", TEST_PASSWORD);
+                ChatHistoryStore.Snapshot senderHistory = restoredSender.loadHistory();
+                ChatHistoryStore.Snapshot receiverHistory = restoredReceiver.loadHistory();
+                check(senderHistory.directMessages().stream()
                         .anyMatch(message -> message.content().equals("direct-p2p-test")),
-                        "PostgreSQL direct history was not restored on another cache");
-                check(recovered.groupMessages().stream()
+                        "sender PostgreSQL history did not survive logout");
+                check(receiverHistory.directMessages().stream()
+                        .anyMatch(message -> message.content().equals("direct-p2p-test")),
+                        "receiver PostgreSQL history did not survive logout");
+                check(senderHistory.groupMessages().stream()
                         .anyMatch(message -> message.content().equals("hello-group")),
-                        "PostgreSQL group history was not restored on another cache");
-                check(!recovered.files().isEmpty(),
-                        "PostgreSQL file metadata was not restored on another cache");
-            check(recovered.files().stream().anyMatch(item ->
-                            "phase1-room".equals(item.file().groupName())),
-                    "PostgreSQL group file metadata was not restored");
+                        "sender group history did not survive logout");
+                check(receiverHistory.groupMessages().stream()
+                        .filter(message -> message.content().equals("hello-group")).count() == 1,
+                        "receiver group history was missing or duplicated");
+                check(receiverHistory.files().size() == 2,
+                        "receiver file history did not survive logout");
+                check(receiverHistory.files().stream().anyMatch(item ->
+                                "phase1-room".equals(item.file().groupName())),
+                        "group file history was not saved in PostgreSQL");
+                check(unrelated.loadHistory().directMessages().isEmpty(),
+                        "history was visible to another account");
             }
             ChatServer reloadedServer = new ChatServer(0);
             ExecutorService reloadedThread = Executors.newSingleThreadExecutor();
@@ -267,14 +253,7 @@ public final class Phase1IntegrationTest {
             serverThread.awaitTermination(5, TimeUnit.SECONDS);
             serverResult.get(5, TimeUnit.SECONDS);
             Files.deleteIfExists(accountFile);
-            Files.deleteIfExists(historyFile);
-            Files.deleteIfExists(Path.of(historyFile + "-wal"));
-            Files.deleteIfExists(Path.of(historyFile + "-shm"));
-            Files.deleteIfExists(remoteHistoryFile);
-            Files.deleteIfExists(Path.of(remoteHistoryFile + "-wal"));
-            Files.deleteIfExists(Path.of(remoteHistoryFile + "-shm"));
             System.clearProperty("chatp2p.usersFile");
-            System.clearProperty("chatp2p.historyFile");
             System.clearProperty("chatp2p.discoveryPort");
             System.clearProperty("chatp2p.db.url");
             try (Connection database = DriverManager.getConnection(baseUrl, login);
