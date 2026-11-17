@@ -1,6 +1,7 @@
 package chatp2p.view;
 
 import java.awt.BorderLayout;
+import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Cursor;
@@ -22,7 +23,10 @@ import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
+import javax.swing.JPasswordField;
 import javax.swing.JTextField;
+import javax.swing.JToggleButton;
+import javax.swing.SwingUtilities;
 import javax.swing.border.AbstractBorder;
 import javax.swing.border.EmptyBorder;
 
@@ -142,6 +146,52 @@ final class AuthView {
         UiTheme.addVerticalGap(form, 4);
         form.add(field);
         UiTheme.addVerticalGap(form, 10);
+    }
+
+    /** Adds a password field with a vector eye button that does not depend on emoji fonts. */
+    static JToggleButton addPasswordField(
+            JPanel form, String labelText, JPasswordField field) {
+        JLabel label = UiTheme.label(
+                labelText, new Font("Segoe UI", Font.BOLD, 11), UiTheme.SLATE);
+        UiTheme.leftAlign(label);
+
+        styleModernInput(field, "");
+        field.setEchoChar('\u2022');
+        field.setBorder(new EmptyBorder(9, 12, 9, 4));
+        field.setOpaque(false);
+
+        JPanel row = UiTheme.panel(new BorderLayout(), new Color(248, 250, 252));
+        Color normalBorder = new Color(226, 232, 240);
+        Color focusedBorder = new Color(203, 213, 225);
+        row.setBorder(new RoundedBorder(normalBorder, 10));
+        row.setPreferredSize(new Dimension(320, 44));
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 44));
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        PasswordEyeButton eye = new PasswordEyeButton(field);
+        row.add(field, BorderLayout.CENTER);
+        row.add(eye, BorderLayout.EAST);
+        field.addFocusListener(new FocusAdapter() {
+            @Override
+            public void focusGained(FocusEvent event) {
+                row.setBackground(Color.WHITE);
+                row.setBorder(new RoundedBorder(focusedBorder, 10));
+                row.repaint();
+            }
+
+            @Override
+            public void focusLost(FocusEvent event) {
+                row.setBackground(new Color(248, 250, 252));
+                row.setBorder(new RoundedBorder(normalBorder, 10));
+                row.repaint();
+            }
+        });
+
+        form.add(label);
+        UiTheme.addVerticalGap(form, 4);
+        form.add(row);
+        UiTheme.addVerticalGap(form, 10);
+        return eye;
     }
 
     /** Styles a modern textfield with rounded borders and focus highlight. */
@@ -465,6 +515,84 @@ final class AuthView {
         }
     }
 
+    /** Clean modern password visibility toggle: neutral slate eye without blue borders or backgrounds. */
+    private static final class PasswordEyeButton extends JToggleButton {
+        private final JPasswordField passwordField;
+
+        private PasswordEyeButton(JPasswordField passwordField) {
+            this.passwordField = passwordField;
+            setPreferredSize(new Dimension(38, 38));
+            setMinimumSize(new Dimension(38, 38));
+            setMaximumSize(new Dimension(38, 38));
+            setFocusable(false);
+            setRequestFocusEnabled(false);
+            setFocusPainted(false);
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setOpaque(false);
+            setBorder(new EmptyBorder(0, 0, 0, 8));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            setToolTipText("Hiện mật khẩu");
+            addActionListener(event -> {
+                boolean visible = isSelected();
+                passwordField.setEchoChar(visible ? (char) 0 : '\u2022');
+                setToolTipText(visible ? "Ẩn mật khẩu" : "Hiện mật khẩu");
+                repaint();
+            });
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            Graphics2D canvas = (Graphics2D) graphics.create();
+            try {
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                canvas.setRenderingHint(
+                        RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
+
+                // Soft subtle neutral hover effect (no colored background box)
+                if (getModel().isRollover()) {
+                    canvas.setColor(new Color(0, 0, 0, 10));
+                    int hoverD = 28;
+                    int hx = (getWidth() - hoverD) / 2;
+                    int hy = (getHeight() - hoverD) / 2;
+                    canvas.fillOval(hx, hy, hoverD, hoverD);
+                }
+
+                int centerX = getWidth() / 2;
+                int centerY = getHeight() / 2;
+                boolean visible = isSelected();
+
+                // Professional slate color (never loud blue)
+                Color strokeColor = getModel().isRollover()
+                        ? new Color(30, 41, 59)     // Slate 800 on hover
+                        : (visible ? new Color(71, 85, 105) : new Color(148, 163, 184)); // Slate 600 / Slate 400
+
+                canvas.setColor(strokeColor);
+                canvas.setStroke(new BasicStroke(
+                        1.7f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+
+                java.awt.geom.Path2D eye = new java.awt.geom.Path2D.Double();
+                eye.moveTo(centerX - 10, centerY);
+                eye.curveTo(centerX - 5, centerY - 6.5, centerX + 5, centerY - 6.5, centerX + 10, centerY);
+                eye.curveTo(centerX + 5, centerY + 6.5, centerX - 5, centerY + 6.5, centerX - 10, centerY);
+                canvas.draw(eye);
+
+                if (visible) {
+                    // Open eye: iris circle + pupil dot
+                    canvas.drawOval(centerX - 3, centerY - 3, 6, 6);
+                    canvas.fillOval(centerX - 1, centerY - 1, 2, 2);
+                } else {
+                    // Hidden: iris outline + clean diagonal slash
+                    canvas.drawOval(centerX - 3, centerY - 3, 6, 6);
+                    canvas.drawLine(centerX - 9, centerY - 8, centerX + 9, centerY + 8);
+                }
+            } finally {
+                canvas.dispose();
+            }
+        }
+    }
+
     /** Focus-aware border drawn inside its bounds so all four blue edges stay visible. */
     private static final class FocusRoundedBorder extends AbstractBorder {
         private final Color normalColor;
@@ -486,7 +614,10 @@ final class AuthView {
                 canvas.setRenderingHint(
                         RenderingHints.KEY_ANTIALIASING,
                         RenderingHints.VALUE_ANTIALIAS_ON);
-                boolean focused = component.isFocusOwner();
+                Component focusOwner = java.awt.KeyboardFocusManager
+                        .getCurrentKeyboardFocusManager().getFocusOwner();
+                boolean focused = component.isFocusOwner()
+                        || (focusOwner != null && SwingUtilities.isDescendingFrom(focusOwner, component));
                 canvas.setColor(focused ? focusColor : normalColor);
                 canvas.setStroke(new java.awt.BasicStroke(focused ? 2f : 1f));
                 int inset = focused ? 1 : 0;

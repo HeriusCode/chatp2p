@@ -16,6 +16,7 @@ import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JProgressBar;
 import javax.swing.JTextField;
+import javax.swing.JToggleButton;
 import javax.swing.SwingWorker;
 import javax.swing.UIManager;
 
@@ -25,6 +26,7 @@ public final class LoginFrame extends JFrame {
     private final JTextField portField;
     private final JTextField usernameField;
     private final JPasswordField passwordField = new JPasswordField();
+    private JToggleButton passwordToggle;
     private final JButton loginButton = new JButton("ĐĂNG NHẬP");
     private final JButton openRegisterButton = new JButton("Tạo tài khoản ngay");
     private final JButton discoverButton = new JButton("TÌM LAN");
@@ -82,7 +84,7 @@ public final class LoginFrame extends JFrame {
 
         // 2. Username & Password Fields
         AuthView.addField(form, "TÊN ĐĂNG NHẬP", usernameField);
-        AuthView.addField(form, "MẬT KHẨU", passwordField);
+        passwordToggle = AuthView.addPasswordField(form, "MẬT KHẨU", passwordField);
         UiTheme.addVerticalGap(form, 4);
 
         // 3. Primary Action Button
@@ -191,7 +193,7 @@ public final class LoginFrame extends JFrame {
     private void setBusy(boolean busy) {
         for (java.awt.Component component : new java.awt.Component[]{
                 hostField, portField, usernameField, passwordField,
-                loginButton, openRegisterButton, discoverButton}) {
+                passwordToggle, loginButton, openRegisterButton, discoverButton}) {
             component.setEnabled(!busy);
         }
         loginButton.setText(busy ? "ĐANG ĐĂNG NHẬP..." : "ĐĂNG NHẬP");

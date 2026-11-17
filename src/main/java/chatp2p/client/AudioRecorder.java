@@ -54,7 +54,7 @@ public final class AudioRecorder implements AutoCloseable {
             recording.set(false);
             Files.deleteIfExists(output);
             throw failure;
-        }
+        }   
     }
 
     public synchronized Path stop() throws IOException {

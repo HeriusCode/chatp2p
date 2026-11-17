@@ -14,6 +14,7 @@ import javax.swing.JPanel;
 import javax.swing.JPasswordField;
 import javax.swing.JProgressBar;
 import javax.swing.JTextField;
+import javax.swing.JToggleButton;
 import javax.swing.SwingWorker;
 
 /** Dedicated modern account registration page with password confirmation and instant login switch. */
@@ -23,6 +24,8 @@ public final class RegisterFrame extends JFrame {
     private final JTextField usernameField;
     private final JPasswordField passwordField = new JPasswordField();
     private final JPasswordField confirmationField = new JPasswordField();
+    private JToggleButton passwordToggle;
+    private JToggleButton confirmationToggle;
     private final JButton registerButton = new JButton("ĐĂNG KÝ TÀI KHOẢN");
     private final JButton backButton = new JButton("Đăng nhập ngay");
     private final JButton discoverButton = new JButton("TÌM LAN");
@@ -57,8 +60,9 @@ public final class RegisterFrame extends JFrame {
 
         // 2. Form fields
         AuthView.addField(form, "TÊN ĐĂNG NHẬP", usernameField);
-        AuthView.addField(form, "MẬT KHẨU", passwordField);
-        AuthView.addField(form, "XÁC NHẬN MẬT KHẨU", confirmationField);
+        passwordToggle = AuthView.addPasswordField(form, "MẬT KHẨU", passwordField);
+        confirmationToggle = AuthView.addPasswordField(
+                form, "XÁC NHẬN MẬT KHẨU", confirmationField);
         UiTheme.addVerticalGap(form, 4);
 
         // 3. Primary Register Button
@@ -166,6 +170,7 @@ public final class RegisterFrame extends JFrame {
     private void setBusy(boolean busy) {
         for (java.awt.Component component : new java.awt.Component[]{
                 hostField, portField, usernameField, passwordField, confirmationField,
+                passwordToggle, confirmationToggle,
                 registerButton, backButton, discoverButton}) {
             component.setEnabled(!busy);
         }

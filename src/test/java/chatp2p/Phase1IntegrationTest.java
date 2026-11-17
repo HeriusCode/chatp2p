@@ -61,7 +61,9 @@ public final class Phase1IntegrationTest {
              Statement setup = database.createStatement()) {
             setup.execute("CREATE SCHEMA " + schema);
         }
-        System.setProperty("chatp2p.db.url", baseUrl + "?currentSchema=" + schema);
+        String testDatabaseUrl = baseUrl + (baseUrl.contains("?") ? "&" : "?")
+                + "currentSchema=" + schema;
+        System.setProperty("chatp2p.db.url", testDatabaseUrl);
         Path accountFile = Files.createTempFile("chatp2p-test-users-", ".dat");
         Files.deleteIfExists(accountFile);
         byte[] salt = new byte[16];
@@ -231,14 +233,14 @@ public final class Phase1IntegrationTest {
                 reloadedResult.get(5, TimeUnit.SECONDS);
             }
             try (Connection database = DriverManager.getConnection(
-                    baseUrl + "?currentSchema=" + schema, login);
+                    testDatabaseUrl, login);
                  Statement query = database.createStatement();
                  ResultSet accounts = query.executeQuery("SELECT count(*) FROM accounts")) {
                 check(accounts.next() && accounts.getInt(1) >= 5,
                         "accounts were not stored in PostgreSQL");
             }
             try (Connection database = DriverManager.getConnection(
-                    baseUrl + "?currentSchema=" + schema, login);
+                    testDatabaseUrl, login);
                  Statement query = database.createStatement();
                  ResultSet invalidGroup = query.executeQuery(
                          "SELECT count(*) FROM chat_groups WHERE name='phase1-invalid'")) {
